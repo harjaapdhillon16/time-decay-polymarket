@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/builder-signing-sdk": "^1.0.0",
     "@polymarket/clob-client": "^4.1.0",
     "axios": "^1.7.9",
     "chalk": "^5.4.1",
