@@ -22,10 +22,12 @@
 //
 //  POST-RESOLUTION REDEMPTION  (via Builder Relayer Client)
 //  ──────────────────────────────────────────────────────────
-//  • After market expiry, polls Gamma API to detect resolution
-//  • Verifies on-chain that the oracle has reported (payoutDenominator > 0)
+//  • After market expiry, polls ON-CHAIN to detect resolution
+//  • PRIMARY: Reads payoutDenominator on CTF contract (source of truth)
+//    If > 0, oracle has reported → reads payoutNumerators to determine winner
+//  • FALLBACK: Gamma API only used if Polygon RPC fails
 //  • Uses @polymarket/builder-relayer-client to relay CTF redeemPositions()
-//    through the user's Safe or Proxy wallet — NO direct ethers contract calls
+//    through the user's Safe or Proxy wallet — gasless
 //  • Supports both standard CTF redeem and NegRisk adapter redeem
 //  • Winning tokens redeem at $1.00 each; losing tokens yield $0
 //  • Retries resolution checks every 15s for up to 10 minutes
@@ -174,8 +176,21 @@ function currentIntervalKey() { return `interval-${intervalStart()}`; }
 //  SECTION 4 — GAMMA API  (market discovery + resolution check)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Helper: safely parse a Gamma API JSON-encoded string field.
+ * Gamma returns many array fields as JSON strings, e.g. '["Up","Down"]'.
+ */
+function _parseJsonField(val) {
+  if (Array.isArray(val)) return val;
+  if (typeof val === 'string') {
+    try { return JSON.parse(val); } catch { return []; }
+  }
+  return [];
+}
+
 async function fetchMarketMeta(slug) {
   try {
+    // ── Strategy 1: /events?slug=<slug> (the event slug from the 5-min series)
     const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
       params: { slug }, timeout: 8_000,
     });
@@ -185,15 +200,8 @@ async function fetchMarketMeta(slug) {
     const market = event.markets?.[0];
     if (!market) return null;
 
-    const tokenIds = (() => {
-      try { return JSON.parse(market.clobTokenIds); }
-      catch { return market.clobTokenIds || []; }
-    })();
-
-    const outcomes = (() => {
-      try { return JSON.parse(market.outcomes); }
-      catch { return market.outcomes || []; }
-    })();
+    const tokenIds = _parseJsonField(market.clobTokenIds);
+    const outcomes = _parseJsonField(market.outcomes);
 
     const upIdx = outcomes.findIndex(o => /up/i.test(o));
     const downIdx = outcomes.findIndex(o => /down/i.test(o));
@@ -203,16 +211,19 @@ async function fetchMarketMeta(slug) {
       : intervalEnd();
 
     // Detect neg_risk for proper redeem routing
-    const negRisk = market.neg_risk === true || market.neg_risk === 'true';
-    const negRiskMarketId = market.neg_risk_market_id || '';
+    const negRisk = event.negRisk === true || market.negRiskOther === true;
+    const negRiskMarketId = event.negRiskMarketID || '';
 
     return {
       slug,
       endTimestamp,
       question: market.question || '',
-      conditionId: market.conditionId || market.condition_id || '',
+      conditionId: market.conditionId || '',
+      marketId: market.id || null,          // Gamma market ID for direct lookups
+      marketSlug: market.slug || null,      // market-level slug (may differ from event slug)
       upTokenId: upIdx >= 0 ? tokenIds[upIdx] : tokenIds[0],
       downTokenId: downIdx >= 0 ? tokenIds[downIdx] : tokenIds[1],
+      outcomes,                              // store parsed outcomes for resolution matching
       negRisk,
       negRiskMarketId,
     };
@@ -223,28 +234,125 @@ async function fetchMarketMeta(slug) {
 }
 
 /**
- * Check whether a market has resolved via Gamma API.
- * Returns { resolved, outcome } or null on error.
+ * Determine the winning outcome from a resolved market's outcomePrices.
+ *
+ * After resolution, Gamma sets outcomePrices to e.g. '["1","0"]' where
+ * the outcome at the index with price "1" (or close to 1.0) is the winner.
+ * Combined with outcomes '["Up","Down"]', we can determine: "Up" won.
+ *
+ * Returns the winning outcome string (e.g. "Up" or "Down"), or null.
  */
-async function checkMarketResolved(slug) {
-  try {
-    const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
-      params: { slug }, timeout: 8_000,
-    });
-    if (!Array.isArray(data) || !data.length) return null;
+function _resolveWinnerFromPrices(outcomePricesRaw, outcomesRaw) {
+  const prices = _parseJsonField(outcomePricesRaw);
+  const outcomes = _parseJsonField(outcomesRaw);
+  if (!prices.length || !outcomes.length) return null;
 
-    const market = data[0].markets?.[0];
-    if (!market) return null;
+  for (let i = 0; i < prices.length; i++) {
+    const p = parseFloat(prices[i]);
+    if (p >= 0.95) return outcomes[i] || null;   // price ~1.0 = winner
+  }
+  return null;
+}
 
-    const resolved = market.resolved === true || market.resolved === 'true';
-    return {
-      resolved,
-      outcome: market.outcome || market.winning_outcome || null,
-    };
-  } catch (err) {
-    log.warn(`Resolution check failed: ${err.message}`);
+/**
+ * Check whether a market has resolved via Gamma API.
+ *
+ * Uses three lookup strategies in priority order:
+ *   1. GET /markets?condition_ids=<conditionId>  (most reliable if we have it)
+ *   2. GET /markets/<marketId>                    (if we stored Gamma market ID)
+ *   3. GET /events?slug=<slug>                    (fallback via event slug)
+ *
+ * The Gamma API has NO "resolved" boolean field. Resolution is detected from:
+ *   • closed === true           (market is closed for trading)
+ *   • active === false          (market is no longer active)
+ *   • resolvedBy !== null       (populated after resolution)
+ *   • outcomePrices             (winner's price → 1.0, loser → 0.0)
+ *   • acceptingOrders === false (not accepting new orders)
+ *
+ * Returns { resolved, outcome, outcomePrices, resolvedBy } or null on error.
+ */
+async function checkMarketResolved(slug, conditionId, marketId) {
+  let market = null;
+
+  // ── Strategy 1: Query by conditionId (most reliable) ────────────────────
+  if (conditionId) {
+    try {
+      const { data } = await axios.get(`${CFG.gammaApiUrl}/markets`, {
+        params: { condition_ids: conditionId, limit: 1 },
+        timeout: 8_000,
+      });
+      if (Array.isArray(data) && data.length) {
+        market = data[0];
+        log.redeem(`  Resolution lookup via condition_id: ${conditionId.slice(0, 16)}…`);
+      }
+    } catch (err) {
+      log.warn(`  condition_id lookup failed: ${err.message}`);
+    }
+  }
+
+  // ── Strategy 2: Query by Gamma market ID ────────────────────────────────
+  if (!market && marketId) {
+    try {
+      const { data } = await axios.get(`${CFG.gammaApiUrl}/markets/${marketId}`, {
+        timeout: 8_000,
+      });
+      if (data && data.id) {
+        market = data;
+        log.redeem(`  Resolution lookup via market ID: ${marketId}`);
+      }
+    } catch (err) {
+      log.warn(`  market ID lookup failed: ${err.message}`);
+    }
+  }
+
+  // ── Strategy 3: Fallback — query events by slug ─────────────────────────
+  if (!market) {
+    try {
+      const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
+        params: { slug }, timeout: 8_000,
+      });
+      if (Array.isArray(data) && data.length) {
+        market = data[0].markets?.[0];
+        if (market) log.redeem(`  Resolution lookup via event slug: ${slug}`);
+      }
+    } catch (err) {
+      log.warn(`  Event slug lookup failed: ${err.message}`);
+    }
+  }
+
+  if (!market) {
+    log.warn(`  No market data found for resolution check (slug=${slug})`);
     return null;
   }
+
+  // ── Detect resolution from actual Gamma API fields ──────────────────────
+  const isClosed = market.closed === true;
+  const isInactive = market.active === false;
+  const hasResolver = !!market.resolvedBy;
+  const notAccepting = market.acceptingOrders === false;
+
+  // outcomePrices is the strongest signal: after resolution, winner = "1", loser = "0"
+  const outcomePrices = _parseJsonField(market.outcomePrices);
+  const hasSettledPrices = outcomePrices.some(p => parseFloat(p) >= 0.95);
+
+  // A market is resolved when it's closed AND prices have settled
+  const resolved = isClosed && (hasSettledPrices || hasResolver);
+
+  // Determine the winning outcome name (e.g. "Up" or "Down")
+  const winningOutcome = resolved
+    ? _resolveWinnerFromPrices(market.outcomePrices, market.outcomes)
+    : null;
+
+  log.redeem(`  Market state: closed=${isClosed} active=${!isInactive} resolvedBy=${market.resolvedBy || 'null'} acceptingOrders=${!notAccepting}`);
+  log.redeem(`  Outcome prices: ${JSON.stringify(outcomePrices)}  →  winner: ${winningOutcome || 'none yet'}`);
+
+  return {
+    resolved,
+    outcome: winningOutcome,
+    outcomePrices,
+    resolvedBy: market.resolvedBy || null,
+    conditionId: market.conditionId || conditionId,
+  };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -701,10 +809,20 @@ const NR_ADAPTER_REDEEM_ABI = [
   },
 ];
 
-const PAYOUT_DENOMINATOR_ABI = [
+const CTF_READ_ABI = [
   {
     inputs: [{ name: 'conditionId', type: 'bytes32' }],
     name: 'payoutDenominator',
+    outputs: [{ name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [
+      { name: 'conditionId', type: 'bytes32' },
+      { name: 'index', type: 'uint256' },
+    ],
+    name: 'payoutNumerators',
     outputs: [{ name: '', type: 'uint256' }],
     stateMutability: 'view',
     type: 'function',
@@ -802,26 +920,105 @@ function buildNegRiskRedeemTx(conditionId, amounts) {
   return { to: NEG_RISK_ADAPTER, data: calldata, value: '0' };
 }
 
-// ── On-chain oracle check (read-only via viem public client) ────────────────
+// ── On-chain resolution check (read-only via viem public client) ────────────
 
-async function checkPayoutDenominator(conditionId) {
+/**
+ * Check on-chain whether the oracle has reported payouts for this condition.
+ *
+ * This is the SOURCE OF TRUTH for resolution — far more reliable than Gamma API,
+ * especially for fast 5-minute up/down markets where Gamma may lag or never
+ * update the `resolved` field.
+ *
+ * Returns:
+ *   { resolved: true,  winner: 'UP'|'DOWN', numerators: [n0, n1] }
+ *   { resolved: false }
+ *   null  (on RPC error)
+ */
+async function checkResolutionOnChain(conditionId, meta) {
   try {
     const client = getViemPublicClient();
-    const result = await client.readContract({
+
+    // 1. Check payoutDenominator — if > 0, oracle has reported
+    const payoutDenom = await client.readContract({
       address: CTF_ADDRESS,
-      abi: PAYOUT_DENOMINATOR_ABI,
+      abi: CTF_READ_ABI,
       functionName: 'payoutDenominator',
       args: [conditionId],
     });
-    return result;
+
+    log.redeem(`  On-chain payoutDenominator: ${payoutDenom.toString()}`);
+
+    if (payoutDenom === 0n || payoutDenom.toString() === '0') {
+      return { resolved: false };
+    }
+
+    // 2. Read payoutNumerators for both outcomes to determine the winner
+    //    For binary markets: index 0 and index 1
+    //    Winner has numerator > 0, loser has numerator = 0
+    const [num0, num1] = await Promise.all([
+      client.readContract({
+        address: CTF_ADDRESS,
+        abi: CTF_READ_ABI,
+        functionName: 'payoutNumerators',
+        args: [conditionId, 0n],
+      }),
+      client.readContract({
+        address: CTF_ADDRESS,
+        abi: CTF_READ_ABI,
+        functionName: 'payoutNumerators',
+        args: [conditionId, 1n],
+      }),
+    ]);
+
+    log.redeem(`  On-chain payoutNumerators: [${num0.toString()}, ${num1.toString()}]`);
+
+    // 3. Map numerator indices back to outcome names (Up/Down)
+    //    meta.outcomes was parsed during fetchMarketMeta — the order matches
+    //    the condition's outcome slot indices.
+    //    e.g. outcomes = ["Up", "Down"] → index 0 = Up, index 1 = Down
+    let winner = null;
+
+    if (meta && Array.isArray(meta.outcomes) && meta.outcomes.length >= 2) {
+      const outcomes = meta.outcomes;
+      if (num0 > 0n && num1 === 0n) {
+        winner = outcomes[0];   // index 0 won
+      } else if (num1 > 0n && num0 === 0n) {
+        winner = outcomes[1];   // index 1 won
+      }
+    }
+
+    // Fallback: if we couldn't map via meta, infer from Up/Down convention
+    // Polymarket 5-min markets typically have outcomes ["Up", "Down"] in that order
+    if (!winner) {
+      if (num0 > 0n && num1 === 0n) winner = 'Up';
+      else if (num1 > 0n && num0 === 0n) winner = 'Down';
+      else winner = 'Unknown';
+    }
+
+    log.redeem(`  On-chain winner: ${winner}`);
+
+    return {
+      resolved: true,
+      winner: winner.toUpperCase(),
+      numerators: [num0, num1],
+    };
+
   } catch (err) {
-    log.warn(`payoutDenominator check failed: ${err.message}`);
+    log.warn(`  On-chain resolution check failed: ${err.message}`);
     return null;
   }
 }
 
 /**
  * Polls for market resolution then redeems tokens via Relayer Client.
+ *
+ * Resolution detection priority:
+ *   1. ON-CHAIN (payoutDenominator > 0 + payoutNumerators) — source of truth
+ *   2. GAMMA API — fallback only if RPC fails
+ *
+ * The Gamma API is unreliable for fast 5-minute up/down markets: it often
+ * never sets `resolved=true` or `closed=true` even after the oracle reports.
+ * On-chain payoutDenominator is the definitive signal that redemption is possible.
  */
 async function pollAndRedeem(slug, attempt = 0) {
   const bet = getBet(slug);
@@ -838,22 +1035,72 @@ async function pollAndRedeem(slug, attempt = 0) {
 
   log.redeem(`${slug}: Checking resolution… (attempt ${attempt + 1}/${REDEEM.maxAttempts})`);
 
-  // ── 1. Check Gamma API for resolution ─────────────────────────────────────
-  const status = await checkMarketResolved(slug);
-
-  if (!status || !status.resolved) {
-    log.redeem(`  Not resolved yet — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
-    setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+  // ── Guard: conditionId required ───────────────────────────────────────────
+  if (!bet.conditionId) {
+    log.error(`  Missing conditionId for ${slug} — cannot check resolution or redeem.`);
+    _ledger.get(slug).redeemResult = { success: false, reason: 'no_condition_id' };
     return;
   }
 
-  log.divider();
-  log.redeem(`✅ Market RESOLVED  —  ${slug}`);
-  log.redeem(`   Outcome: ${status.outcome || 'unknown'}`);
+  // ── 1. PRIMARY: Check on-chain (payoutDenominator + payoutNumerators) ─────
+  //    This is the source of truth. If payoutDenominator > 0, the UMA oracle
+  //    has reported and tokens are redeemable RIGHT NOW.
+  const meta = _metaCacheMap.get(slug) || null;
+  let resolvedOutcome = null;
+  let resolvedVia = null;
 
-  // ── 2. Determine win/loss ─────────────────────────────────────────────────
+  const onChain = await checkResolutionOnChain(bet.conditionId, meta);
+
+  if (onChain && onChain.resolved) {
+    resolvedOutcome = onChain.winner;
+    resolvedVia = 'on-chain (payoutNumerators)';
+    log.redeem(`  ✓ On-chain resolution confirmed — winner: ${resolvedOutcome}`);
+
+  } else if (onChain && !onChain.resolved) {
+    // On-chain says not resolved yet (payoutDenominator = 0)
+    log.redeem(`  On-chain: not resolved yet (payoutDenominator = 0)`);
+
+    // ── 2. FALLBACK: Try Gamma API as a hint ────────────────────────────────
+    //    Even if Gamma says "resolved", we still need payoutDenominator > 0
+    //    to actually redeem. But Gamma can tell us if we're close.
+    const gammaStatus = await checkMarketResolved(slug, bet.conditionId, bet.marketId || null);
+    if (gammaStatus?.resolved) {
+      log.redeem(`  Gamma says resolved (${gammaStatus.outcome}) but oracle not on-chain yet — waiting…`);
+    }
+
+    log.redeem(`  Retrying in ${REDEEM.pollIntervalMs / 1000}s`);
+    setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+    return;
+
+  } else {
+    // onChain === null → RPC error. Fall back to Gamma API entirely.
+    log.warn(`  On-chain check failed — falling back to Gamma API`);
+
+    const gammaStatus = await checkMarketResolved(slug, bet.conditionId, bet.marketId || null);
+    if (!gammaStatus || !gammaStatus.resolved) {
+      log.redeem(`  Gamma: not resolved yet — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
+      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+      return;
+    }
+
+    resolvedOutcome = (gammaStatus.outcome || '').toUpperCase();
+    resolvedVia = 'Gamma API (RPC fallback)';
+
+    if (!resolvedOutcome) {
+      log.warn(`  Gamma says resolved but no winner determined — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
+      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+      return;
+    }
+
+    log.redeem(`  ✓ Gamma resolution — winner: ${resolvedOutcome}`);
+  }
+
+  // ── 3. Determine win/loss ─────────────────────────────────────────────────
+  log.divider();
+  log.redeem(`✅ Market RESOLVED  —  ${slug}  (via ${resolvedVia})`);
+  log.redeem(`   Outcome: ${resolvedOutcome}`);
+
   const ourSide = bet.side.toUpperCase();
-  const resolvedOutcome = (status.outcome || '').toUpperCase();
   const won = resolvedOutcome === ourSide;
 
   if (won) {
@@ -862,7 +1109,7 @@ async function pollAndRedeem(slug, attempt = 0) {
     log.redeem(`   😞 We bet ${ourSide}, resolved ${resolvedOutcome} — loss.`);
   }
 
-  // ── 3. Dry-run simulation ─────────────────────────────────────────────────
+  // ── 4. Dry-run simulation ─────────────────────────────────────────────────
   if (CFG.dryRun) {
     const payout = won ? bet.sharesFilled * 1.00 : 0;
     const pnl = payout - bet.betSizeUsdc;
@@ -880,27 +1127,8 @@ async function pollAndRedeem(slug, attempt = 0) {
     return;
   }
 
-  // ── 4. Guard: conditionId required ────────────────────────────────────────
-  if (!bet.conditionId) {
-    log.error(`  Missing conditionId for ${slug} — cannot redeem.`);
-    _ledger.get(slug).redeemResult = { success: false, reason: 'no_condition_id' };
-    return;
-  }
-
   try {
-    // ── 5. Verify oracle reported on-chain (payoutDenominator > 0) ──────────
-    const payoutDenom = await checkPayoutDenominator(bet.conditionId);
-
-    if (payoutDenom !== null) {
-      log.redeem(`  On-chain payoutDenominator: ${payoutDenom.toString()}`);
-      if (payoutDenom.toString() === '0' || payoutDenom === 0n) {
-        log.warn('  Oracle has not reported on-chain yet (reportPayouts pending) — retrying…');
-        setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-        return;
-      }
-    }
-
-    // ── 6. Build and relay the redeem transaction ───────────────────────────
+    // ── 5. Build and relay the redeem transaction ───────────────────────────
     const relay = getRelayClient();
     const isNegRisk = bet.negRisk === true;
 
@@ -908,8 +1136,6 @@ async function pollAndRedeem(slug, attempt = 0) {
     let redeemLabel;
 
     if (isNegRisk) {
-      // NegRisk adapter: pass token amounts [yesAmount, noAmount]
-      // Redeem all tokens for both outcomes — winner pays $1, loser pays $0
       const yesAmount = won && ourSide === 'UP'
         ? BigInt(Math.floor(bet.sharesFilled * 1e6))
         : 0n;
@@ -920,7 +1146,6 @@ async function pollAndRedeem(slug, attempt = 0) {
       redeemTx = buildNegRiskRedeemTx(bet.conditionId, [yesAmount, noAmount]);
       redeemLabel = 'NegRisk adapter redeem';
     } else {
-      // Standard CTF redeem — burns all tokens for the condition, pays winners
       redeemTx = buildCtfRedeemTx(bet.conditionId);
       redeemLabel = 'CTF redeem';
     }
@@ -1171,6 +1396,7 @@ async function poll() {
     sharesFilled,
     tokenId,
     conditionId: signal.meta.conditionId || null,
+    marketId: signal.meta.marketId || null,
     negRisk: signal.meta.negRisk || false,
     placedAt: new Date().toISOString(),
   });
