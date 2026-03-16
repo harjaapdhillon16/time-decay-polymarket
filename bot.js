@@ -20,12 +20,14 @@
 //    4. Schedules a P&L snapshot exactly 1 second before market expiry
 //  • Never bets twice on the same 5-minute window
 //
-//  POSITION CLOSE (T – 5 s)
-//  ────────────────────────
-//  • Sells the position BEFORE market expiry while the orderbook is active
-//  • Uses aggressive pricing (best bid or slightly below) for fast fill
-//  • Retries once at T – 3 s if the first attempt fails
-//  • If all sell attempts fail, Polymarket auto-redeems winning positions
+//  POST-RESOLUTION REDEMPTION
+//  ──────────────────────────
+//  • After market expiry, polls Gamma API to detect resolution
+//  • Verifies on-chain that the oracle has reported (payoutDenominator > 0)
+//  • Calls CTF redeemPositions() on Polygon to exchange tokens for USDC.e
+//  • Winning tokens redeem at $1.00 each; losing tokens yield $0
+//  • Retries resolution checks every 15s for up to 10 minutes
+//  • No deadline — winning tokens are always redeemable
 //
 //  P&L SNAPSHOT (T – 1 s)
 //  ──────────────────────
@@ -40,8 +42,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import 'dotenv/config';
-import { ClobClient, Side, OrderType, AssetType } from '@polymarket/clob-client';
-import { Wallet }    from 'ethers';
+import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import { Wallet, Contract, JsonRpcProvider } from 'ethers';
 import axios         from 'axios';
 import chalk         from 'chalk';
 import { WebSocket } from 'ws';
@@ -89,12 +91,7 @@ const CFG = {
   clobApiUrl:          process.env.CLOB_API_URL   || 'https://clob.polymarket.com',
   chainId:             _envInt('CHAIN_ID',                 137),
 
-  // Seconds before expiry to attempt the sell close.
-  // Must be > 0 (orderbook shuts down at T=0). Default 5s gives a safe margin.
-  sellBeforeExpirySecs: _envInt('SELL_BEFORE_EXPIRY_SECS', 3),
-
   // Assets scanned in priority order — first match wins each interval.
-  // Slug prefixes must match Polymarket's naming: btc-updown-5m-*, xrp-updown-5m-*, sol-updown-5m-*
   assets: [
     { id: 'btc', label: 'BTC', slugPrefix: 'btc-updown-5m', emoji: '₿' },
     { id: 'xrp', label: 'XRP', slugPrefix: 'xrp-updown-5m', emoji: '✕' },
@@ -104,6 +101,13 @@ const CFG = {
 
 if (CFG.probMin >= CFG.probMax)
   throw new Error(`PROB_MIN (${CFG.probMin}) must be < PROB_MAX (${CFG.probMax})`);
+
+// ── Redemption constants (no env vars — hardcoded) ──────────────────────────
+const REDEEM = {
+  polygonRpcUrl:    'https://polygon-rpc.com',
+  pollIntervalMs:   15_000,   // check resolution every 15s
+  maxAttempts:      40,       // 40 × 15s = ~10 minutes
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 2 — LOGGER
@@ -118,6 +122,7 @@ const log  = {
   trade:   (...a) => console.log(ts(), chalk.magentaBright('[TRADE]'),...a),
   scan:    (...a) => console.log(ts(), chalk.blue('[SCAN]'),         ...a),
   pnl:     (...a) => console.log(ts(), chalk.bgGreen.black('[P&L]'), ...a),
+  redeem:  (...a) => console.log(ts(), chalk.bgCyan.black('[REDEEM]'), ...a),
   dry:     (...a) => console.log(ts(), chalk.bgYellow.black('[DRY]'),...a),
   divider: ()     => console.log(chalk.gray('─'.repeat(72))),
 };
@@ -129,45 +134,20 @@ const pct = (v) => v != null ? `${(v * 100).toFixed(2)}%` : 'n/a';
 
 const INTERVAL_SECS = 300; // 5 minutes
 
-/** Unix seconds of the START of the current 5-min interval. */
 function intervalStart() {
   const now = Math.floor(Date.now() / 1000);
   return now - (now % INTERVAL_SECS);
 }
 
-/** Unix seconds of the END (expiry) of the current 5-min interval. */
 function intervalEnd() { return intervalStart() + INTERVAL_SECS; }
-
-/** Seconds remaining until the current 5-min interval expires. */
 function secsToExpiry() { return intervalEnd() - Math.floor(Date.now() / 1000); }
-
-/**
- * Builds the Polymarket event slug for a given asset and the current interval.
- * e.g. buildSlug('btc-updown-5m') → 'btc-updown-5m-1742120400'
- */
 function buildSlug(slugPrefix) { return `${slugPrefix}-${intervalStart()}`; }
-
-/**
- * A unique key representing the current 5-min interval window.
- * Used to ensure we place at most ONE bet across ALL assets per window.
- */
 function currentIntervalKey() { return `interval-${intervalStart()}`; }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 4 — GAMMA API  (market discovery)
+//  SECTION 4 — GAMMA API  (market discovery + resolution check)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * Fetches 5-min market metadata for a given slug (any asset).
- * Returns null when the market isn't indexed yet (Gamma can lag ~10–20 s).
- *
- * Shape returned:
- * {
- *   slug, endTimestamp,
- *   upTokenId, downTokenId, question,
- *   conditionId   ← needed for GET /data/trades filter
- * }
- */
 async function fetchMarketMeta(slug) {
   try {
     const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
@@ -210,6 +190,31 @@ async function fetchMarketMeta(slug) {
   }
 }
 
+/**
+ * Check whether a market has resolved via Gamma API.
+ * Returns { resolved, outcome } or null on error.
+ */
+async function checkMarketResolved(slug) {
+  try {
+    const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
+      params: { slug }, timeout: 8_000,
+    });
+    if (!Array.isArray(data) || !data.length) return null;
+
+    const market = data[0].markets?.[0];
+    if (!market) return null;
+
+    const resolved = market.resolved === true || market.resolved === 'true';
+    return {
+      resolved,
+      outcome: market.outcome || market.winning_outcome || null,
+    };
+  } catch (err) {
+    log.warn(`Resolution check failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 5 — CLOB REST  (price fallback)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -242,7 +247,7 @@ const WS_RETRY_MS = 3_000;
 class WsMonitor extends EventEmitter {
   constructor() {
     super();
-    this._prices    = new Map();   // tokenId → mid-price (0–1)
+    this._prices    = new Map();
     this._bestBid   = new Map();
     this._bestAsk   = new Map();
     this._subscribed = new Set();
@@ -357,7 +362,6 @@ class WsMonitor extends EventEmitter {
 
 const wsMonitor = new WsMonitor();
 
-/** Resolve price: WS first, REST fallback. */
 async function livePrice(tokenId) {
   const ws = wsMonitor.getPrice(tokenId);
   if (ws != null) return ws;
@@ -371,24 +375,12 @@ async function livePrice(tokenId) {
 let _clobClient = null;
 let _traderReady = false;
 
-/**
- * Initialises the authenticated ClobClient.
- *
- * API credential resolution order:
- *  1. If CLOB_API_KEY + CLOB_SECRET + CLOB_PASSPHRASE are all set in .env
- *     → use them directly (most reliable, recommended for Magic/Google accounts)
- *  2. Otherwise → derive credentials on-the-fly from the wallet private key.
- *     For signatureType=1 (Magic/Google), the derivation client must include
- *     signatureType and funderAddress — per the official Polymarket Python SDK.
- */
 async function initTrader() {
   if (_traderReady) return _clobClient;
 
   const signer = new Wallet(CFG.privateKey);
-
   let creds;
 
-  // ── Path A: credentials supplied directly in .env ─────────────────────────
   if (CFG.clobApiKey && CFG.clobSecret && CFG.clobPassphrase) {
     log.ok('Using API credentials from .env (CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE)');
     creds = {
@@ -396,8 +388,6 @@ async function initTrader() {
       secret:     CFG.clobSecret,
       passphrase: CFG.clobPassphrase,
     };
-
-  // ── Path B: derive credentials from wallet signature ──────────────────────
   } else {
     log.info('Deriving API credentials from wallet signature…');
     log.info('(Tip: paste CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE into .env to skip this step)');
@@ -405,12 +395,8 @@ async function initTrader() {
     const derivationClient = CFG.signatureType === 0
       ? new ClobClient(CFG.clobApiUrl, CFG.chainId, signer)
       : new ClobClient(
-          CFG.clobApiUrl,
-          CFG.chainId,
-          signer,
-          undefined,           // no creds yet
-          CFG.signatureType,   // 1 = Magic/Google, 2 = Gnosis Safe
-          CFG.funderAddress,   // proxy wallet address
+          CFG.clobApiUrl, CFG.chainId, signer,
+          undefined, CFG.signatureType, CFG.funderAddress,
         );
 
     try {
@@ -447,12 +433,9 @@ async function initTrader() {
   log.ok(`API key: ${creds.apiKey.slice(0, 10)}…`);
 
   _clobClient = new ClobClient(
-    CFG.clobApiUrl,
-    CFG.chainId,
-    signer,
+    CFG.clobApiUrl, CFG.chainId, signer,
     { key: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase },
-    CFG.signatureType,
-    CFG.funderAddress,
+    CFG.signatureType, CFG.funderAddress,
   );
 
   _traderReady = true;
@@ -460,7 +443,6 @@ async function initTrader() {
   return _clobClient;
 }
 
-/** Fetches minimum tick size for a token (BTC markets = "0.01"). */
 async function getTickSize(tokenId) {
   if (_clobClient) {
     try {
@@ -471,13 +453,8 @@ async function getTickSize(tokenId) {
   return '0.01';
 }
 
-/**
- * Place a FOK market BUY order.
- * Returns { success, orderId, fillPrice, sharesFilled, costUsdc }
- */
 async function placeOrder({ tokenId, price, sizeUsdc, label }) {
   const client = await initTrader();
-
   log.trade(`FOK BUY  ${label}  $${sizeUsdc} USDC  @~${pct(price)}`);
 
   try {
@@ -510,12 +487,6 @@ async function placeOrder({ tokenId, price, sizeUsdc, label }) {
 //  SECTION 8 — TRADE HISTORY  (for P&L: fetch actual fill from /data/trades)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * Fetches the most recent trade for a given tokenId from GET /data/trades.
- * Returns { price, size, side } or null.
- *
- * Requires authenticated client (L2 header).
- */
 async function fetchFillFromTrades(tokenId) {
   if (!_traderReady || !_clobClient) return null;
   try {
@@ -545,38 +516,17 @@ async function fetchFillFromTrades(tokenId) {
 //  SECTION 9 — BET TRACKER
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * In-memory ledger.  Each entry:
- * {
- *   slug, side, betSizeUsdc,
- *   orderId,
- *   fillPrice,   ← actual execution price (or entry price in dry-run)
- *   sharesFilled,
- *   tokenId,
- *   placedAt,
- *   sellResult:  null | { success, orderId, sellPrice, proceeds, pnl }
- *   pnlSnapshot: null | { secsLeft, currentPrice, unrealisedPnl, outlook, snappedAt }
- * }
- */
 const _ledger = new Map();
 
-function recordBet(slug, data) { _ledger.set(slug, { ...data, sellResult: null, pnlSnapshot: null }); }
+function recordBet(slug, data) { _ledger.set(slug, { ...data, redeemResult: null, pnlSnapshot: null }); }
 function hasBet(slug)          { return _ledger.has(slug); }
 function getBet(slug)          { return _ledger.get(slug); }
-
-function allBets() {
-  return [..._ledger.entries()].map(([slug, d]) => ({ slug, ...d }));
-}
+function allBets()             { return [..._ledger.entries()].map(([slug, d]) => ({ slug, ...d })); }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 10 — P&L SNAPSHOT  (runs at T − 1 s, LOGGING ONLY — no sell)
+//  SECTION 10 — P&L SNAPSHOT  (runs at T − 1 s, LOGGING ONLY)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * Derive the market end timestamp directly from its slug.
- * e.g. "sol-updown-5m-1773662700" → 1773662700 + 300 = 1773663000
- * This avoids relying on secsToExpiry() which rolls over to the next interval.
- */
 function slugEndTimestamp(slug) {
   const ts = parseInt(slug.split('-').pop(), 10);
   return isNaN(ts) ? intervalEnd() : ts + INTERVAL_SECS;
@@ -586,15 +536,6 @@ function slugSecsLeft(slug) {
   return slugEndTimestamp(slug) - Math.floor(Date.now() / 1000);
 }
 
-/**
- * Called exactly 1 second before market expiry for a slug we bet on.
- * PURE LOGGING — does NOT attempt to sell (sell happens at T − 5 s).
- *
- *  1. Fetch actual fill from /data/trades (if live)
- *  2. Read current market price (WS / REST)
- *  3. Calculate unrealised P&L
- *  4. Print P&L card
- */
 async function takePnlSnapshot(slug) {
   const bet = getBet(slug);
   if (!bet) return;
@@ -603,7 +544,6 @@ async function takePnlSnapshot(slug) {
   log.divider();
   log.pnl(`P&L SNAPSHOT  —  ${slug}  (${secsLeft}s to expiry)`);
 
-  // ── 1. Fill price ─────────────────────────────────────────────────────────
   let fillPrice    = bet.fillPrice;
   let sharesFilled = bet.sharesFilled;
 
@@ -620,7 +560,6 @@ async function takePnlSnapshot(slug) {
     log.pnl(`Fill (dry-run estimate):   ${pct(fillPrice)}  ×  ${sharesFilled.toFixed(4)} shares`);
   }
 
-  // ── 2. Current price ──────────────────────────────────────────────────────
   const currentPrice = await livePrice(bet.tokenId);
   log.pnl(`Current price:             ${pct(currentPrice)}`);
 
@@ -629,13 +568,11 @@ async function takePnlSnapshot(slug) {
     return;
   }
 
-  // ── 3. P&L ───────────────────────────────────────────────────────────────
   const costUsdc        = bet.betSizeUsdc;
   const potentialPayout = sharesFilled * 1.00;
   const unrealisedPnl   = (currentPrice - fillPrice) * sharesFilled;
   const estimatedValue  = currentPrice * sharesFilled;
 
-  // ── 4. Outlook ────────────────────────────────────────────────────────────
   let outlook, outlookColour;
   if (currentPrice >= 0.90) {
     outlook       = '✅  LIKELY WIN   (price ≥ 90%)';
@@ -648,12 +585,6 @@ async function takePnlSnapshot(slug) {
     outlookColour = chalk.yellow;
   }
 
-  // ── 5. Sell status ────────────────────────────────────────────────────────
-  const sellStatus = bet.sellResult
-    ? (bet.sellResult.success ? `✅ SOLD @ ${pct(bet.sellResult.sellPrice)}` : `❌ Sell failed`)
-    : '⏳ Pending (auto-redeem at expiry)';
-
-  // ── 6. Print card ─────────────────────────────────────────────────────────
   log.divider();
   console.log(chalk.bgMagenta.white.bold('  ┌─────────────────────────────────────────┐  '));
   console.log(chalk.bgMagenta.white.bold('  │         P&L SNAPSHOT (T − 1s)           │  '));
@@ -671,178 +602,228 @@ async function takePnlSnapshot(slug) {
   console.log(chalk.white(`  Max Win   : +$${(potentialPayout - costUsdc).toFixed(2)} USDC`));
   console.log(chalk.white(`  Max Loss  : -$${costUsdc.toFixed(2)} USDC`));
   console.log(outlookColour(`  Outlook   : ${outlook}`));
-  console.log(chalk.white(`  Close     : ${sellStatus}`));
   log.divider();
 
-  // ── 7. Persist snapshot to ledger ────────────────────────────────────────
   _ledger.get(slug).pnlSnapshot = {
-    secsLeft,
-    fillPrice,
-    sharesFilled,
-    currentPrice,
-    unrealisedPnl,
-    estimatedValue,
-    outlook,
+    secsLeft, fillPrice, sharesFilled, currentPrice,
+    unrealisedPnl, estimatedValue, outlook,
     snappedAt: new Date().toISOString(),
   };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 10b — PRE-EXPIRY SELL  (fires at T − 5 s, BEFORE market closes)
+//  SECTION 10b — POST-RESOLUTION TOKEN REDEMPTION (via CTF contract)
 // ──────────────────────────────────────────────────────────────────────────────
 //
-//  WHY PRE-EXPIRY:
-//  After a 5-minute market expires and resolves, the CLOB orderbook is closed.
-//  No new orders (BUY or SELL) are accepted. The old approach of selling at
-//  T + 30 s always fails because there is no orderbook to match against.
+//  After market expiry + UMA oracle resolution, winning conditional tokens can
+//  be redeemed for $1.00 USDC.e each by calling redeemPositions() on the
+//  Conditional Token Framework (CTF) contract on Polygon.
 //
-//  By selling at T − 5 s the orderbook is still active, counterparties exist,
-//  and the GTC limit sell can match immediately.
+//  Redemption burns your entire token balance for the condition. There is no
+//  amount parameter — all tokens for both outcomes are processed:
+//    • Winning tokens → $1.00 USDC.e each
+//    • Losing tokens  → $0.00  (burned, no payout)
 //
-//  If the pre-expiry sell fails, Polymarket automatically redeems winning
-//  conditional tokens into USDC during settlement (typically within minutes).
+//  Payout vectors:
+//    Up wins  → [1, 0]  →  Up tokens = $1, Down tokens = $0
+//    Down wins → [0, 1]  →  Up tokens = $0, Down tokens = $1
 //
-//  SELL MECHANICS:
-//  - Uses `createAndPostOrder` (GTC limit) — NOT `createAndPostMarketOrder`
-//  - Price: best bid from WS, minus one tick for aggressive fill
-//  - Size: number of shares (not dollars)
-//  - Retries once at T − 3 s if first attempt fails
+//  Addresses (Polygon mainnet):
+//    CTF:     0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+//    USDC.e:  0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+
+const CTF_ADDRESS    = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const USDCE_ADDRESS  = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const PARENT_COLLECTION_ID = '0x0000000000000000000000000000000000000000000000000000000000000000';
+
+const CTF_ABI = [
+  'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets) external',
+  'function balanceOf(address owner, uint256 id) view returns (uint256)',
+  'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
+];
+
+let _provider = null;
+let _ctfContract = null;
+
+function getProvider() {
+  if (!_provider) _provider = new JsonRpcProvider(REDEEM.polygonRpcUrl);
+  return _provider;
+}
+
+function getCtfContract() {
+  if (!_ctfContract) {
+    const signer = new Wallet(CFG.privateKey, getProvider());
+    _ctfContract = new Contract(CTF_ADDRESS, CTF_ABI, signer);
+  }
+  return _ctfContract;
+}
 
 /**
- * Attempt to sell the position for `slug` while the orderbook is still live.
- *
- * @param {string} slug   — market slug (lookup in _ledger)
- * @param {number} attempt — 0 = first try (T−5s), 1 = retry (T−3s)
+ * Polls for market resolution then redeems tokens on-chain.
  */
-async function preExpirySell(slug, attempt = 0) {
+async function pollAndRedeem(slug, attempt = 0) {
   const bet = getBet(slug);
   if (!bet) return;
 
-  // Already sold successfully — skip
-  if (bet.sellResult?.success) return;
+  if (bet.redeemResult?.success) return;
 
-  const secsLeft = slugSecsLeft(slug);
+  if (attempt >= REDEEM.maxAttempts) {
+    log.warn(`${slug}: Gave up waiting for resolution after ${attempt} attempts.`);
+    log.warn('  Tokens remain in wallet — redeem manually at any time (no deadline).');
+    _ledger.get(slug).redeemResult = { success: false, reason: 'timeout' };
+    return;
+  }
+
+  log.redeem(`${slug}: Checking resolution… (attempt ${attempt + 1}/${REDEEM.maxAttempts})`);
+
+  // ── 1. Check Gamma API for resolution ─────────────────────────────────────
+  const status = await checkMarketResolved(slug);
+
+  if (!status || !status.resolved) {
+    log.redeem(`  Not resolved yet — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
+    setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+    return;
+  }
+
   log.divider();
-  log.trade(`🔄  PRE-EXPIRY SELL  ${slug}  attempt ${attempt + 1}/2  (${secsLeft}s left)`);
+  log.redeem(`✅ Market RESOLVED  —  ${slug}`);
+  log.redeem(`   Outcome: ${status.outcome || 'unknown'}`);
 
+  // ── 2. Determine win/loss ─────────────────────────────────────────────────
+  const ourSide = bet.side.toUpperCase();
+  const resolvedOutcome = (status.outcome || '').toUpperCase();
+  const won = resolvedOutcome === ourSide;
+
+  if (won) {
+    log.redeem(`   🎉 We bet ${ourSide} — WE WON!`);
+  } else {
+    log.redeem(`   😞 We bet ${ourSide}, resolved ${resolvedOutcome} — loss.`);
+  }
+
+  // ── 3. Dry-run simulation ─────────────────────────────────────────────────
   if (CFG.dryRun) {
-    const simPrice = await livePrice(bet.tokenId) ?? bet.fillPrice;
-    const proceeds = simPrice * bet.sharesFilled;
-    const pnl      = proceeds - bet.betSizeUsdc;
-    log.dry(`[SIMULATED SELL] ${bet.sharesFilled?.toFixed(4)} shares @ ${pct(simPrice)}  P&L: $${pnl.toFixed(4)}`);
-    _ledger.get(slug).sellResult = {
-      success: true, orderId: `DRY-SELL-${Date.now()}`,
-      sellPrice: simPrice, proceeds, pnl,
+    const payout = won ? bet.sharesFilled * 1.00 : 0;
+    const pnl    = payout - bet.betSizeUsdc;
+    const c      = pnl >= 0 ? chalk.greenBright : chalk.redBright;
+
+    log.dry(`[SIMULATED REDEEM] conditionId: ${bet.conditionId?.slice(0, 20)}…`);
+    log.dry(`  Shares    : ${bet.sharesFilled.toFixed(4)}`);
+    log.dry(`  Payout    : $${payout.toFixed(4)} USDC.e  (winning = $1.00/token, losing = $0.00)`);
+    log.dry(`  P&L       : ${c(`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`)}`);
+
+    _ledger.get(slug).redeemResult = {
+      success: true, txHash: `DRY-REDEEM-${Date.now()}`,
+      usdcReceived: payout, pnl, outcome: resolvedOutcome, won,
     };
     return;
   }
 
-  // ── Guard: if market already expired, don't bother ────────────────────────
-  if (secsLeft <= 0) {
-    log.warn(`  Market already expired (${secsLeft}s ago) — orderbook is closed.`);
-    log.warn('  Winning positions will auto-redeem via Polymarket settlement.');
-    _ledger.get(slug).sellResult = { success: false, reason: 'expired' };
+  // ── 4. Guard: conditionId required ────────────────────────────────────────
+  if (!bet.conditionId) {
+    log.error(`  Missing conditionId for ${slug} — cannot redeem on-chain.`);
+    _ledger.get(slug).redeemResult = { success: false, reason: 'no_condition_id' };
     return;
   }
 
-  const client = await initTrader();
-
-  // ── Refresh CLOB balance so it sees the shares from our BUY ───────────────
   try {
-    await client.updateBalanceAllowance({
-      asset_type: AssetType.CONDITIONAL,
-      token_id:   bet.tokenId,
-    });
-  } catch (err) {
-    log.warn(`  updateBalanceAllowance: ${err.message} (continuing anyway)`);
-  }
+    const ctf = getCtfContract();
 
-  // ── Determine sell price: best bid → midpoint → fillPrice ─────────────────
-  let sellPrice = wsMonitor.getBestBid(bet.tokenId);
-  if (sellPrice == null) sellPrice = wsMonitor.getPrice(bet.tokenId);
-  if (sellPrice == null) sellPrice = await restMidpoint(bet.tokenId);
-  if (sellPrice == null) sellPrice = bet.fillPrice;
-
-  // Sanity: don't sell far below our entry for a likely-winning position
-  if (sellPrice < bet.fillPrice * 0.5 && bet.fillPrice > 0.5) {
-    log.warn(`  Sell price ${pct(sellPrice)} looks too low vs fill ${pct(bet.fillPrice)} — using fill price`);
-    sellPrice = bet.fillPrice;
-  }
-
-  // ── Align price to tick grid, cap at 0.99 ────────────────────────────────
-  const tickSize = await getTickSize(bet.tokenId);
-  const tick     = parseFloat(tickSize);
-  // Subtract one tick from best bid for aggressive fill (taker-like)
-  const aggressive = Math.floor((sellPrice - tick) / tick) * tick;
-  const capped     = Math.min(Math.max(aggressive, tick), 0.99);
-  const decimals   = Math.ceil(-Math.log10(tick));
-  const priceStr   = capped.toFixed(decimals);
-
-  // ── Floor shares to 4 decimal places ──────────────────────────────────────
-  const sharesRounded = Math.floor(bet.sharesFilled * 10000) / 10000;
-  if (sharesRounded <= 0) {
-    log.warn(`  No sellable shares (rounded to 0) — skipping`);
-    return;
-  }
-
-  log.trade(`  GTC limit SELL  ${sharesRounded} shares @ ${priceStr}  (tick: ${tickSize})`);
-  log.trade(`  Token: ${bet.tokenId.slice(0, 20)}…`);
-
-  try {
-    const resp = await client.createAndPostOrder(
-      {
-        tokenID:    bet.tokenId,
-        price:      parseFloat(priceStr),
-        size:       sharesRounded,
-        side:       Side.SELL,
-        feeRateBps: 1000,
-        expiration: 0,
-        taker:      '0x0000000000000000000000000000000000000000',
-      },
-      { negRisk: false, tickSize },
-      OrderType.GTC,
-    );
-
-    if (resp?.orderID && resp.success !== false) {
-      const proceeds = parseFloat(priceStr) * sharesRounded;
-      const pnl      = proceeds - bet.betSizeUsdc;
-      const c        = pnl >= 0 ? chalk.greenBright : chalk.redBright;
-
-      log.ok(`✅  Sell order placed!  ID: ${resp.orderID}  status: ${resp.status}`);
-      log.ok(`    Est. proceeds : $${proceeds.toFixed(4)} USDC`);
-      log.ok(`    Est. P&L      : ${c(`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDC`)}`);
-
-      _ledger.get(slug).sellResult = {
-        success: true, orderId: resp.orderID,
-        sellPrice: parseFloat(priceStr), proceeds, pnl,
-      };
-      return;
+    // ── 5. Verify oracle reported on-chain (payoutDenominator > 0) ──────────
+    try {
+      const payoutDenom = await ctf.payoutDenominator(bet.conditionId);
+      log.redeem(`  On-chain payoutDenominator: ${payoutDenom.toString()}`);
+      if (payoutDenom.toString() === '0') {
+        log.warn('  Oracle has not reported on-chain yet (reportPayouts pending) — retrying…');
+        setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+        return;
+      }
+    } catch (err) {
+      log.warn(`  payoutDenominator check failed: ${err.message} — proceeding anyway`);
     }
 
-    const msg = resp?.errorMsg || JSON.stringify(resp);
-    log.warn(`  Sell order not accepted: ${msg}`);
+    // ── 6. Call CTF.redeemPositions() ───────────────────────────────────────
+    log.redeem(`  Calling CTF.redeemPositions()…`);
+    log.redeem(`    CTF contract : ${CTF_ADDRESS}`);
+    log.redeem(`    Collateral   : ${USDCE_ADDRESS} (USDC.e)`);
+    log.redeem(`    ConditionId  : ${bet.conditionId}`);
+    log.redeem(`    IndexSets    : [1, 2]  (both outcomes — only winner pays out)`);
+
+    const tx = await ctf.redeemPositions(
+      USDCE_ADDRESS,
+      PARENT_COLLECTION_ID,
+      bet.conditionId,
+      [1, 2],
+    );
+
+    log.redeem(`  Tx submitted: ${tx.hash}`);
+    log.redeem(`  Waiting for confirmation…`);
+
+    const receipt = await tx.wait(1);
+
+    if (receipt.status === 1) {
+      const payout = won ? bet.sharesFilled * 1.00 : 0;
+      const pnl    = payout - bet.betSizeUsdc;
+      const c      = pnl >= 0 ? chalk.greenBright : chalk.redBright;
+
+      log.divider();
+      console.log(chalk.bgCyan.black.bold('  ┌─────────────────────────────────────────┐  '));
+      console.log(chalk.bgCyan.black.bold('  │       REDEMPTION CONFIRMED ✓            │  '));
+      console.log(chalk.bgCyan.black.bold('  └─────────────────────────────────────────┘  '));
+      console.log(chalk.white(`  Market     : ${slug}`));
+      console.log(chalk.white(`  Tx Hash    : ${tx.hash}`));
+      console.log(chalk.white(`  Block      : ${receipt.blockNumber}`));
+      console.log(chalk.white(`  Gas used   : ${receipt.gasUsed.toString()}`));
+      console.log(chalk.white(`  Our bet    : ${ourSide}`));
+      console.log(chalk.white(`  Outcome    : ${resolvedOutcome}`));
+      console.log(chalk.white(`  Result     : ${won ? '🎉 WIN' : '😞 LOSS'}`));
+      console.log(chalk.white(`  Shares     : ${bet.sharesFilled.toFixed(4)}`));
+      console.log(chalk.white(`  Payout     : $${payout.toFixed(4)} USDC.e`));
+      console.log(chalk.white(`  Cost       : $${bet.betSizeUsdc.toFixed(2)} USDC`));
+      console.log(c(            `  P&L        : ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDC`));
+      log.divider();
+
+      _ledger.get(slug).redeemResult = {
+        success: true, txHash: tx.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString(),
+        usdcReceived: payout, pnl,
+        outcome: resolvedOutcome, won,
+      };
+    } else {
+      log.error(`  Tx reverted!  hash: ${tx.hash}`);
+      _ledger.get(slug).redeemResult = { success: false, reason: 'tx_reverted', txHash: tx.hash };
+
+      if (attempt < REDEEM.maxAttempts - 1) {
+        log.info('  Retrying redemption in 30s…');
+        setTimeout(() => pollAndRedeem(slug, attempt + 1), 30_000);
+      }
+    }
 
   } catch (err) {
-    log.error(`  Sell error: ${err.message}`);
-  }
+    log.error(`  Redemption tx failed: ${err.message}`);
 
-  // ── Retry once more (attempt 0 → retry at T−3s, attempt 1 → give up) ────
-  if (attempt === 0) {
-    const retryInMs = Math.max((secsLeft - 3) * 1000, 1000);
-    log.info(`  Retrying in ${(retryInMs / 1000).toFixed(1)}s…`);
-    setTimeout(() => preExpirySell(slug, 1), retryInMs);
-  } else {
-    log.warn('  All sell attempts failed. Winning positions auto-redeem at settlement.');
-    _ledger.get(slug).sellResult = { success: false, reason: 'sell_failed' };
+    if (err.message.includes('revert') || err.message.includes('CALL_EXCEPTION')) {
+      log.warn('  This usually means the UMA oracle hasn\'t settled on-chain yet.');
+      log.warn(`  Retrying in ${REDEEM.pollIntervalMs / 1000}s…`);
+      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
+    } else {
+      _ledger.get(slug).redeemResult = { success: false, reason: err.message };
+    }
   }
+}
+
+function scheduleRedemption(slug, asset) {
+  const secsLeft = slugSecsLeft(slug);
+  const delayMs = Math.max((secsLeft + 10) * 1000, 1000);
+  log.info(`${asset.label}: Redemption poll starts in ${(delayMs / 1000).toFixed(0)}s (after expiry + 10s buffer)`);
+  setTimeout(() => pollAndRedeem(slug, 0), delayMs);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 11 — MARKET META CACHE + WS SUBSCRIPTIONS
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Cache keyed by slug — holds metadata for all three assets simultaneously
-const _metaCacheMap = new Map();   // slug → meta
+const _metaCacheMap = new Map();
 let _wsSubscribed = new Set();
 
 async function resolvedMeta(slug) {
@@ -869,60 +850,36 @@ function ensureWsSubscription(meta) {
 //  SECTION 12 — POLL LOOP  (runs every POLL_INTERVAL_MS)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Tracks which slugs have a P&L snapshot already scheduled
-const _pnlScheduled  = new Set();
-
-// Tracks which slugs have a pre-expiry sell already scheduled
-const _sellScheduled = new Set();
-
-// Tracks which 5-min interval windows we have already placed a bet in.
+const _pnlScheduled    = new Set();
+const _redeemScheduled = new Set();
 const _bettedIntervals = new Set();
 
-/**
- * Schedule both the pre-expiry sell and P&L snapshot for a given slug.
- * Safe to call multiple times — idempotent via _sellScheduled / _pnlScheduled.
- */
-function scheduleCloseAndSnapshot(slug, asset) {
-  const secsLeft = slugSecsLeft(slug);
-
-  // ── Schedule pre-expiry SELL at T − sellBeforeExpirySecs ──────────────────
-  if (!_sellScheduled.has(slug)) {
-    _sellScheduled.add(slug);
-    const sellDelay = Math.max((secsLeft - CFG.sellBeforeExpirySecs) * 1000, 500);
-    log.info(`${asset.label}: SELL scheduled in ${(sellDelay / 1000).toFixed(1)}s (T−${CFG.sellBeforeExpirySecs}s)`);
-    setTimeout(() => preExpirySell(slug, 0), sellDelay);
-  }
-
-  // ── Schedule P&L snapshot at T − 1 s ─────────────────────────────────────
+function scheduleSnapshotAndRedemption(slug, asset) {
   if (!_pnlScheduled.has(slug)) {
     _pnlScheduled.add(slug);
+    const secsLeft  = slugSecsLeft(slug);
     const snapDelay = Math.max((secsLeft - 1) * 1000, 500);
     log.info(`${asset.label}: P&L snapshot in ${(snapDelay / 1000).toFixed(1)}s`);
     setTimeout(() => takePnlSnapshot(slug), snapDelay);
   }
+
+  if (!_redeemScheduled.has(slug)) {
+    _redeemScheduled.add(slug);
+    scheduleRedemption(slug, asset);
+  }
 }
 
-/**
- * Evaluate a single asset: fetch its meta, subscribe WS, resolve prices,
- * and check whether either UP or DOWN satisfies the probability window.
- *
- * Returns a signal object if a bet should be placed, or null.
- * { asset, slug, meta, side, price, tokenId }
- */
 async function evaluateAsset(asset, timeLeft) {
   const slug = buildSlug(asset.slugPrefix);
 
-  // Fetch / cache market metadata
   const meta = await resolvedMeta(slug);
   if (!meta || !meta.upTokenId || !meta.downTokenId) {
     log.warn(`  ${asset.label}: market not indexed yet — skipping`);
     return null;
   }
 
-  // Ensure WS is streaming this asset's tokens
   ensureWsSubscription(meta);
 
-  // Resolve live prices (WS → REST fallback)
   const [upP, downP] = await Promise.all([
     livePrice(meta.upTokenId),
     livePrice(meta.downTokenId),
@@ -934,13 +891,11 @@ async function evaluateAsset(asset, timeLeft) {
     `DOWN: ${pct(downP).padStart(7)}  (${src})`
   );
 
-  // Check probability window
   const upFit   = upP   != null && upP   > CFG.probMin && upP   < CFG.probMax;
   const downFit = downP != null && downP > CFG.probMin && downP < CFG.probMax;
 
   if (!upFit && !downFit) return null;
 
-  // Pick the side with higher conviction (usually only one qualifies)
   let side, price, tokenId;
   if (upFit && downFit) {
     if ((upP ?? 0) >= (downP ?? 0)) { side = 'UP';   price = upP;   tokenId = meta.upTokenId; }
@@ -961,18 +916,15 @@ async function poll() {
   log.divider();
   log.scan(`⏱  ${timeLeft}s to expiry  |  interval: ${intervalStart()}`);
 
-  // ── 1. Schedule sell + P&L for any existing bot-placed bets this interval ─
   for (const asset of CFG.assets) {
     const slug = buildSlug(asset.slugPrefix);
     if (hasBet(slug)) {
-      scheduleCloseAndSnapshot(slug, asset);
+      scheduleSnapshotAndRedemption(slug, asset);
     }
   }
 
-  // ── 2. Skip if outside trigger window ─────────────────────────────────────
   if (timeLeft >= CFG.expiryThresholdSecs) return;
 
-  // ── 3. Only one bet per 5-min interval across ALL assets ──────────────────
   if (_bettedIntervals.has(intervalKey)) {
     const bettedSlug = CFG.assets
       .map(a => buildSlug(a.slugPrefix))
@@ -982,11 +934,9 @@ async function poll() {
     return;
   }
 
-  // ── 4. Scan all assets in priority order ──────────────────────────────────
   log.scan(`Scanning ${CFG.assets.map(a => a.label).join(' → ')} (priority order)…`);
 
   let signal = null;
-
   for (const asset of CFG.assets) {
     const result = await evaluateAsset(asset, timeLeft);
     if (result) {
@@ -1003,7 +953,6 @@ async function poll() {
 
   const { asset, slug, side, price, tokenId } = signal;
 
-  // ── 5. Print signal card ──────────────────────────────────────────────────
   log.divider();
   log.trade(`🎯  SIGNAL  —  ${asset.emoji} ${asset.label}`);
   log.trade(`    Slug    : ${slug}`);
@@ -1013,7 +962,6 @@ async function poll() {
   log.trade(`    Expiry  : ${timeLeft}s`);
   log.divider();
 
-  // ── 6. Place bet or simulate ──────────────────────────────────────────────
   let orderId, fillPrice, sharesFilled;
 
   if (CFG.dryRun) {
@@ -1032,7 +980,6 @@ async function poll() {
     sharesFilled = result.sharesFilled ?? CFG.betSizeUsdc / price;
   }
 
-  // ── 7. Record bet and mark interval as done ───────────────────────────────
   recordBet(slug, {
     side,
     asset:       asset.label,
@@ -1048,8 +995,7 @@ async function poll() {
   _bettedIntervals.add(intervalKey);
   log.ok(`Bet recorded ✓  ${asset.label} ${side}  orderId=${orderId}`);
 
-  // ── 8. Schedule pre-expiry sell + P&L snapshot ────────────────────────────
-  scheduleCloseAndSnapshot(slug, asset);
+  scheduleSnapshotAndRedemption(slug, asset);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1072,8 +1018,8 @@ function printSessionSummary() {
 
   for (const b of bets) {
     totalCost += b.betSizeUsdc;
-    const snap = b.pnlSnapshot;
-    const sell = b.sellResult;
+    const snap   = b.pnlSnapshot;
+    const redeem = b.redeemResult;
 
     console.log(chalk.cyan(`  ${b.slug}`));
     console.log(`    Asset    : ${b.asset || 'unknown'}`);
@@ -1082,19 +1028,22 @@ function printSessionSummary() {
     console.log(`    Fill     : ${pct(b.fillPrice)}  × ${b.sharesFilled?.toFixed(4)} shares`);
     console.log(`    Cost     : $${b.betSizeUsdc}`);
 
-    if (sell?.success) {
-      totalPnl += sell.pnl;
-      const plColour = sell.pnl >= 0 ? chalk.green : chalk.red;
-      console.log(`    Sell     : ✅ @ ${pct(sell.sellPrice)}  orderId=${sell.orderId}`);
-      console.log(`    Proceeds : $${sell.proceeds?.toFixed(4)}`);
-      console.log(`    P&L      : ${plColour(`${sell.pnl >= 0 ? '+' : ''}$${sell.pnl.toFixed(4)}`)}`);
-    } else if (sell) {
-      console.log(chalk.yellow(`    Sell     : ❌ failed (${sell.reason || 'unknown'}) — auto-redeem expected`));
+    if (redeem?.success) {
+      totalPnl += redeem.pnl;
+      const plColour = redeem.pnl >= 0 ? chalk.green : chalk.red;
+      console.log(`    Outcome  : ${redeem.won ? '🎉 WIN' : '😞 LOSS'}  (${redeem.outcome})`);
+      console.log(`    Redeemed : ✅  tx: ${redeem.txHash?.slice(0, 20)}…`);
+      console.log(`    Payout   : $${redeem.usdcReceived?.toFixed(4)} USDC.e`);
+      console.log(`    P&L      : ${plColour(`${redeem.pnl >= 0 ? '+' : ''}$${redeem.pnl.toFixed(4)}`)}`);
+    } else if (redeem) {
+      console.log(chalk.yellow(`    Redeem   : ❌ ${redeem.reason || 'failed'} — tokens remain in wallet (redeemable anytime)`));
+    } else {
+      console.log(chalk.gray('    Redeem   : ⏳ pending (resolution not yet detected)'));
     }
 
     if (snap) {
       const pl = snap.unrealisedPnl;
-      if (!sell?.success) totalPnl += pl; // use unrealised if no sell
+      if (!redeem?.success) totalPnl += pl;
       const plColour = pl >= 0 ? chalk.green : chalk.red;
       console.log(`    Unr. P&L : ${plColour(`${pl >= 0 ? '+' : ''}$${pl.toFixed(4)}`)}`);
       console.log(`    Outlook  : ${snap.outlook}`);
@@ -1123,15 +1072,15 @@ console.log(`   Assets     :  BTC (1st) → XRP (2nd) → SOL (3rd)  [priority o
 console.log(`   Strategy   :  ${pct(CFG.probMin)} < P < ${pct(CFG.probMax)}  — first qualifying asset wins`);
 console.log(`   Trigger    :  last ${CFG.expiryThresholdSecs}s before expiry`);
 console.log(`   Bet size   :  $${CFG.betSizeUsdc} USDC  (one bet per 5-min window)`);
-console.log(`   Sell close :  T − ${CFG.sellBeforeExpirySecs}s (pre-expiry, while orderbook is live)`);
+console.log(`   Exit       :  Post-resolution CTF redemption (redeemPositions)`);
 console.log(`   P&L snap   :  T − 1s before market close`);
 console.log(`   Auth type  :  ${CFG.signatureType === 0 ? '0 — EOA / MetaMask' : CFG.signatureType === 1 ? '1 — Google / Magic Link proxy' : '2 — Gnosis Safe'}`);
 console.log(`   Mode       :  ${CFG.dryRun ? '✅  DRY-RUN (no real orders)' : '🔴  LIVE TRADING'}`);
 console.log(`   Poll       :  every ${CFG.pollIntervalMs}ms`);
+console.log(`   Redeem     :  poll every ${REDEEM.pollIntervalMs / 1000}s, up to ${REDEEM.maxAttempts} attempts`);
 console.log('');
 log.divider();
 
-// Validate credentials for live mode
 if (!CFG.dryRun) {
   if (!CFG.privateKey   || CFG.privateKey   === '0xYOUR_PRIVATE_KEY_HERE')
     { log.error('PRIVATE_KEY missing/placeholder in .env'); process.exit(1); }
@@ -1146,19 +1095,26 @@ if (!CFG.dryRun) {
     log.error(`Trader init failed: ${err.message}`);
     process.exit(1);
   }
+
+  // Verify Polygon RPC for redemption
+  log.info('Verifying Polygon RPC connectivity…');
+  try {
+    const blockNum = await getProvider().getBlockNumber();
+    log.ok(`Polygon RPC connected — latest block: ${blockNum}`);
+  } catch (err) {
+    log.warn(`Polygon RPC check failed: ${err.message}`);
+    log.warn('Redemption may fail — the bot will still place bets and Polymarket auto-redeems winners.');
+  }
 } else {
   log.dry('Trader init skipped (dry-run).');
 }
 
-// Global error resilience — keep the process alive on transient errors
 process.on('uncaughtException',  err => log.error(`Uncaught: ${err.message}`));
 process.on('unhandledRejection', err => log.error(`Unhandled rejection: ${err}`));
 
-// Graceful shutdown
 process.on('SIGINT',  () => { printSessionSummary(); wsMonitor.close(); process.exit(0); });
 process.on('SIGTERM', () => { printSessionSummary(); wsMonitor.close(); process.exit(0); });
 
-// ── Start ──────────────────────────────────────────────────────────────────
 log.info(`Polling every ${CFG.pollIntervalMs}ms — press Ctrl+C to stop`);
 
 await poll();
