@@ -1,0 +1,87 @@
+# ================================================================
+#  Polymarket Multi-Asset 5-Min Bot  —  .env
+#  Copy this file to .env and fill in your values.
+#  NEVER commit your real .env to git.
+# ================================================================
+
+
+# ----------------------------------------------------------------
+#  STEP 1 — YOUR WALLET CREDENTIALS
+# ----------------------------------------------------------------
+#
+#  IF YOU SIGNED UP WITH GOOGLE / EMAIL (Magic Link):
+#  ───────────────────────────────────────────────────
+#  1. Go to:  https://reveal.magic.link/polymarket
+#             (or Polymarket → Cash → ⋯ → Export Private Key)
+#  2. Copy the private key shown → paste as PRIVATE_KEY below
+#
+#  3. Find your PROXY address (this is NOT the same as the EOA key):
+#     → Log into polymarket.com
+#     → Click your avatar / profile in the top-right
+#     → Copy the 0x… address shown — that is your FUNDER_ADDRESS
+#
+#  4. Set SIGNATURE_TYPE=1  (required for Magic/Google accounts)
+#
+#  ⚠️  NO MATIC NEEDED — Polymarket pays all gas fees via its relayer.
+#     You only need USDC in your account to bet with.
+#
+#  IF YOU USE METAMASK / A PLAIN EOA WALLET:
+#  ──────────────────────────────────────────
+#  1. PRIVATE_KEY    = your MetaMask private key
+#  2. FUNDER_ADDRESS = your MetaMask wallet address (same as the key)
+#  3. SIGNATURE_TYPE = 0
+
+PRIVATE_KEY=
+FUNDER_ADDRESS=
+
+CLOB_API_KEY=
+CLOB_PASSPHRASE=
+CLOB_SECRET=
+# 0 = MetaMask / plain EOA
+# 1 = Google / email / Magic Link  ← use this if you signed up with Google
+# 2 = Gnosis Safe
+SIGNATURE_TYPE=1
+
+
+# ----------------------------------------------------------------
+#  STEP 2 — STRATEGY SETTINGS  (defaults are fine to start)
+# ----------------------------------------------------------------
+
+# How much USDC to bet per trade
+BET_SIZE_USDC=3
+
+# Only bet when probability is strictly BETWEEN these two values:
+#   default: 80% < P < 90%
+PROB_MIN=0.80
+PROB_MAX=0.90
+
+# Only enter the trigger window when this many seconds are left before expiry
+#   default: 90 seconds (1 min 30 sec)
+EXPIRY_THRESHOLD_SECS=75
+
+# How often to poll the market (milliseconds)
+#   default: every 5 seconds
+POLL_INTERVAL_MS=5000
+
+
+# ----------------------------------------------------------------
+#  STEP 3 — SAFETY SWITCH
+# ----------------------------------------------------------------
+
+# true  → DRY-RUN mode: prints signals but places NO real orders
+# false → LIVE mode: places real FOK BUY orders with your USDC
+#
+# ✅ Always test with DRY_RUN=true first before going live.
+DRY_RUN=false
+
+# ----------------------------------------------------------------
+#  ADVANCED — API ENDPOINTS  (do not change unless you know why)
+# ----------------------------------------------------------------
+
+GAMMA_API_URL=https://gamma-api.polymarket.com
+CLOB_API_URL=https://clob.polymarket.com
+CHAIN_ID=137
+
+BUILDER_API_KEY=
+BUILDER_SECRET=
+BUILDER_PASSPHRASE=
