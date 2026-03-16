@@ -43,53 +43,53 @@
 
 import 'dotenv/config';
 import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
-import { Wallet, Contract, JsonRpcProvider } from 'ethers';
-import axios         from 'axios';
-import chalk         from 'chalk';
+import ethers from 'ethers';
+import axios from 'axios';
+import chalk from 'chalk';
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-
+const { Wallet, Contract, JsonRpcProvider } = ethers;
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 1 — CONFIGURATION
 // ──────────────────────────────────────────────────────────────────────────────
 
 function _envFloat(key, def) {
   const v = process.env[key]; if (!v) return def;
-  const n = parseFloat(v);    if (isNaN(n)) throw new Error(`${key} must be a number`);
+  const n = parseFloat(v); if (isNaN(n)) throw new Error(`${key} must be a number`);
   return n;
 }
 function _envInt(key, def) {
   const v = process.env[key]; if (!v) return def;
-  const n = parseInt(v, 10);  if (isNaN(n)) throw new Error(`${key} must be an integer`);
+  const n = parseInt(v, 10); if (isNaN(n)) throw new Error(`${key} must be an integer`);
   return n;
 }
 
 const CFG = {
-  privateKey:          process.env.PRIVATE_KEY    || null,
-  funderAddress:       process.env.FUNDER_ADDRESS || null,
+  privateKey: process.env.PRIVATE_KEY || null,
+  funderAddress: process.env.FUNDER_ADDRESS || null,
   // signatureType:
   //   0 = Plain MetaMask / EOA wallet (PRIVATE_KEY is the wallet key directly)
   //   1 = Google / email / Magic Link account (PRIVATE_KEY = Magic EOA key,
   //       FUNDER_ADDRESS = your Polymarket proxy/profile address)
   //   2 = Gnosis Safe proxy wallet
-  signatureType:       _envInt('SIGNATURE_TYPE',           0),
+  signatureType: _envInt('SIGNATURE_TYPE', 0),
 
   // Optional: paste pre-generated CLOB credentials here to skip derivation.
   // Run `node get-creds.js` once to generate them, then set in .env.
   // This is required for Magic/Google accounts if auto-derivation fails.
-  clobApiKey:          process.env.CLOB_API_KEY    || null,
-  clobSecret:          process.env.CLOB_SECRET     || null,
-  clobPassphrase:      process.env.CLOB_PASSPHRASE || null,
+  clobApiKey: process.env.CLOB_API_KEY || null,
+  clobSecret: process.env.CLOB_SECRET || null,
+  clobPassphrase: process.env.CLOB_PASSPHRASE || null,
 
-  betSizeUsdc:         _envFloat('BET_SIZE_USDC',         5),
-  probMin:             _envFloat('PROB_MIN',               0.80),
-  probMax:             _envFloat('PROB_MAX',               0.90),
-  expiryThresholdSecs: _envInt('EXPIRY_THRESHOLD_SECS',    90),
-  pollIntervalMs:      _envInt('POLL_INTERVAL_MS',         5_000),
-  dryRun:              (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false',
-  gammaApiUrl:         process.env.GAMMA_API_URL  || 'https://gamma-api.polymarket.com',
-  clobApiUrl:          process.env.CLOB_API_URL   || 'https://clob.polymarket.com',
-  chainId:             _envInt('CHAIN_ID',                 137),
+  betSizeUsdc: _envFloat('BET_SIZE_USDC', 5),
+  probMin: _envFloat('PROB_MIN', 0.80),
+  probMax: _envFloat('PROB_MAX', 0.90),
+  expiryThresholdSecs: _envInt('EXPIRY_THRESHOLD_SECS', 90),
+  pollIntervalMs: _envInt('POLL_INTERVAL_MS', 5_000),
+  dryRun: (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false',
+  gammaApiUrl: process.env.GAMMA_API_URL || 'https://gamma-api.polymarket.com',
+  clobApiUrl: process.env.CLOB_API_URL || 'https://clob.polymarket.com',
+  chainId: _envInt('CHAIN_ID', 137),
 
   // Assets scanned in priority order — first match wins each interval.
   assets: [
@@ -104,27 +104,27 @@ if (CFG.probMin >= CFG.probMax)
 
 // ── Redemption constants (no env vars — hardcoded) ──────────────────────────
 const REDEEM = {
-  polygonRpcUrl:    'https://polygon-rpc.com',
-  pollIntervalMs:   15_000,   // check resolution every 15s
-  maxAttempts:      40,       // 40 × 15s = ~10 minutes
+  polygonRpcUrl: 'https://polygon-rpc.com',
+  pollIntervalMs: 15_000,   // check resolution every 15s
+  maxAttempts: 40,       // 40 × 15s = ~10 minutes
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 2 — LOGGER
 // ──────────────────────────────────────────────────────────────────────────────
 
-const ts   = () => chalk.gray(new Date().toISOString());
-const log  = {
-  info:    (...a) => console.log(ts(), chalk.cyan('[INFO]'),         ...a),
-  ok:      (...a) => console.log(ts(), chalk.green('[OK]'),          ...a),
-  warn:    (...a) => console.log(ts(), chalk.yellow('[WARN]'),        ...a),
-  error:   (...a) => console.error(ts(), chalk.red('[ERROR]'),       ...a),
-  trade:   (...a) => console.log(ts(), chalk.magentaBright('[TRADE]'),...a),
-  scan:    (...a) => console.log(ts(), chalk.blue('[SCAN]'),         ...a),
-  pnl:     (...a) => console.log(ts(), chalk.bgGreen.black('[P&L]'), ...a),
-  redeem:  (...a) => console.log(ts(), chalk.bgCyan.black('[REDEEM]'), ...a),
-  dry:     (...a) => console.log(ts(), chalk.bgYellow.black('[DRY]'),...a),
-  divider: ()     => console.log(chalk.gray('─'.repeat(72))),
+const ts = () => chalk.gray(new Date().toISOString());
+const log = {
+  info: (...a) => console.log(ts(), chalk.cyan('[INFO]'), ...a),
+  ok: (...a) => console.log(ts(), chalk.green('[OK]'), ...a),
+  warn: (...a) => console.log(ts(), chalk.yellow('[WARN]'), ...a),
+  error: (...a) => console.error(ts(), chalk.red('[ERROR]'), ...a),
+  trade: (...a) => console.log(ts(), chalk.magentaBright('[TRADE]'), ...a),
+  scan: (...a) => console.log(ts(), chalk.blue('[SCAN]'), ...a),
+  pnl: (...a) => console.log(ts(), chalk.bgGreen.black('[P&L]'), ...a),
+  redeem: (...a) => console.log(ts(), chalk.bgCyan.black('[REDEEM]'), ...a),
+  dry: (...a) => console.log(ts(), chalk.bgYellow.black('[DRY]'), ...a),
+  divider: () => console.log(chalk.gray('─'.repeat(72))),
 };
 const pct = (v) => v != null ? `${(v * 100).toFixed(2)}%` : 'n/a';
 
@@ -155,8 +155,8 @@ async function fetchMarketMeta(slug) {
     });
     if (!Array.isArray(data) || !data.length) return null;
 
-    const event   = data[0];
-    const market  = event.markets?.[0];
+    const event = data[0];
+    const market = event.markets?.[0];
     if (!market) return null;
 
     const tokenIds = (() => {
@@ -169,7 +169,7 @@ async function fetchMarketMeta(slug) {
       catch { return market.outcomes || []; }
     })();
 
-    const upIdx   = outcomes.findIndex(o => /up/i.test(o));
+    const upIdx = outcomes.findIndex(o => /up/i.test(o));
     const downIdx = outcomes.findIndex(o => /down/i.test(o));
 
     const endTimestamp = event.endDate
@@ -179,9 +179,9 @@ async function fetchMarketMeta(slug) {
     return {
       slug,
       endTimestamp,
-      question:    market.question || '',
+      question: market.question || '',
       conditionId: market.conditionId || market.condition_id || '',
-      upTokenId:   upIdx   >= 0 ? tokenIds[upIdx]   : tokenIds[0],
+      upTokenId: upIdx >= 0 ? tokenIds[upIdx] : tokenIds[0],
       downTokenId: downIdx >= 0 ? tokenIds[downIdx] : tokenIds[1],
     };
   } catch (err) {
@@ -231,7 +231,7 @@ async function restMidpoint(tokenId) {
       { params: { token_id: tokenId, side: 'BUY' }, timeout: 6_000 });
     if (data?.price != null) return parseFloat(data.price);
   } catch (err) {
-    log.warn(`REST price fetch failed for ${tokenId.slice(0,10)}…: ${err.message}`);
+    log.warn(`REST price fetch failed for ${tokenId.slice(0, 10)}…: ${err.message}`);
   }
   return null;
 }
@@ -240,20 +240,20 @@ async function restMidpoint(tokenId) {
 //  SECTION 6 — WEBSOCKET MONITOR  (real-time prices)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const WS_URL      = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-const WS_HB_MS    = 20_000;
+const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
+const WS_HB_MS = 20_000;
 const WS_RETRY_MS = 3_000;
 
 class WsMonitor extends EventEmitter {
   constructor() {
     super();
-    this._prices    = new Map();
-    this._bestBid   = new Map();
-    this._bestAsk   = new Map();
+    this._prices = new Map();
+    this._bestBid = new Map();
+    this._bestAsk = new Map();
     this._subscribed = new Set();
-    this._ws        = null;
-    this._alive     = false;
-    this._hbTimer   = null;
+    this._ws = null;
+    this._alive = false;
+    this._hbTimer = null;
     this._retryTimer = null;
   }
 
@@ -266,10 +266,10 @@ class WsMonitor extends EventEmitter {
     }
   }
 
-  getPrice(id)   { return this._prices.get(id)  ?? null; }
+  getPrice(id) { return this._prices.get(id) ?? null; }
   getBestBid(id) { return this._bestBid.get(id) ?? null; }
   getBestAsk(id) { return this._bestAsk.get(id) ?? null; }
-  get connected(){ return this._ws?.readyState === WebSocket.OPEN; }
+  get connected() { return this._ws?.readyState === WebSocket.OPEN; }
 
   close() {
     this._alive = false;
@@ -326,8 +326,8 @@ class WsMonitor extends EventEmitter {
       }
       case 'book': {
         if (!asset_id) break;
-        const bid = bids?.length  ? parseFloat(bids[bids.length - 1].price) : null;
-        const ask = asks?.length  ? parseFloat(asks[0].price)               : null;
+        const bid = bids?.length ? parseFloat(bids[bids.length - 1].price) : null;
+        const ask = asks?.length ? parseFloat(asks[0].price) : null;
         if (bid != null) this._bestBid.set(asset_id, bid);
         if (ask != null) this._bestAsk.set(asset_id, ask);
         const mid = bid != null && ask != null ? (bid + ask) / 2 : (ask ?? bid);
@@ -384,8 +384,8 @@ async function initTrader() {
   if (CFG.clobApiKey && CFG.clobSecret && CFG.clobPassphrase) {
     log.ok('Using API credentials from .env (CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE)');
     creds = {
-      apiKey:     CFG.clobApiKey,
-      secret:     CFG.clobSecret,
+      apiKey: CFG.clobApiKey,
+      secret: CFG.clobSecret,
       passphrase: CFG.clobPassphrase,
     };
   } else {
@@ -395,9 +395,9 @@ async function initTrader() {
     const derivationClient = CFG.signatureType === 0
       ? new ClobClient(CFG.clobApiUrl, CFG.chainId, signer)
       : new ClobClient(
-          CFG.clobApiUrl, CFG.chainId, signer,
-          undefined, CFG.signatureType, CFG.funderAddress,
-        );
+        CFG.clobApiUrl, CFG.chainId, signer,
+        undefined, CFG.signatureType, CFG.funderAddress,
+      );
 
     try {
       creds = await derivationClient.deriveApiKey();
@@ -466,8 +466,8 @@ async function placeOrder({ tokenId, price, sizeUsdc, label }) {
 
     if (resp?.orderID && resp.success !== false) {
       const sharesFilled = resp.takingAmount ? parseFloat(resp.takingAmount) : sizeUsdc / price;
-      const costUsdc     = resp.makingAmount ? parseFloat(resp.makingAmount) : sizeUsdc;
-      const fillPrice    = costUsdc / sharesFilled;
+      const costUsdc = resp.makingAmount ? parseFloat(resp.makingAmount) : sizeUsdc;
+      const fillPrice = costUsdc / sharesFilled;
 
       log.ok(`Order filled ✓  ID: ${resp.orderID}  shares: ${sharesFilled.toFixed(4)}  fill: ${pct(fillPrice)}`);
       return { success: true, orderId: resp.orderID, fillPrice, sharesFilled, costUsdc };
@@ -491,7 +491,7 @@ async function fetchFillFromTrades(tokenId) {
   if (!_traderReady || !_clobClient) return null;
   try {
     const resp = await _clobClient.getTrades({
-      asset_id:     tokenId,
+      asset_id: tokenId,
       maker_address: CFG.funderAddress,
     });
     const trades = Array.isArray(resp) ? resp : (resp?.data ?? []);
@@ -503,8 +503,8 @@ async function fetchFillFromTrades(tokenId) {
 
     return {
       price: parseFloat(latest.price),
-      size:  parseFloat(latest.size),
-      side:  latest.side,
+      size: parseFloat(latest.size),
+      side: latest.side,
     };
   } catch (err) {
     log.warn(`fetchFillFromTrades: ${err.message}`);
@@ -519,9 +519,9 @@ async function fetchFillFromTrades(tokenId) {
 const _ledger = new Map();
 
 function recordBet(slug, data) { _ledger.set(slug, { ...data, redeemResult: null, pnlSnapshot: null }); }
-function hasBet(slug)          { return _ledger.has(slug); }
-function getBet(slug)          { return _ledger.get(slug); }
-function allBets()             { return [..._ledger.entries()].map(([slug, d]) => ({ slug, ...d })); }
+function hasBet(slug) { return _ledger.has(slug); }
+function getBet(slug) { return _ledger.get(slug); }
+function allBets() { return [..._ledger.entries()].map(([slug, d]) => ({ slug, ...d })); }
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 10 — P&L SNAPSHOT  (runs at T − 1 s, LOGGING ONLY)
@@ -544,13 +544,13 @@ async function takePnlSnapshot(slug) {
   log.divider();
   log.pnl(`P&L SNAPSHOT  —  ${slug}  (${secsLeft}s to expiry)`);
 
-  let fillPrice    = bet.fillPrice;
+  let fillPrice = bet.fillPrice;
   let sharesFilled = bet.sharesFilled;
 
   if (!CFG.dryRun) {
     const fill = await fetchFillFromTrades(bet.tokenId);
     if (fill) {
-      fillPrice    = fill.price;
+      fillPrice = fill.price;
       sharesFilled = fill.size;
       log.pnl(`Fill (from /data/trades):  ${pct(fillPrice)}  ×  ${sharesFilled.toFixed(4)} shares`);
     } else {
@@ -568,20 +568,20 @@ async function takePnlSnapshot(slug) {
     return;
   }
 
-  const costUsdc        = bet.betSizeUsdc;
+  const costUsdc = bet.betSizeUsdc;
   const potentialPayout = sharesFilled * 1.00;
-  const unrealisedPnl   = (currentPrice - fillPrice) * sharesFilled;
-  const estimatedValue  = currentPrice * sharesFilled;
+  const unrealisedPnl = (currentPrice - fillPrice) * sharesFilled;
+  const estimatedValue = currentPrice * sharesFilled;
 
   let outlook, outlookColour;
   if (currentPrice >= 0.90) {
-    outlook       = '✅  LIKELY WIN   (price ≥ 90%)';
+    outlook = '✅  LIKELY WIN   (price ≥ 90%)';
     outlookColour = chalk.greenBright;
   } else if (currentPrice <= 0.10) {
-    outlook       = '❌  LIKELY LOSS  (price ≤ 10%)';
+    outlook = '❌  LIKELY LOSS  (price ≤ 10%)';
     outlookColour = chalk.redBright;
   } else {
-    outlook       = '⚠️   UNCERTAIN   (outcome unclear)';
+    outlook = '⚠️   UNCERTAIN   (outcome unclear)';
     outlookColour = chalk.yellow;
   }
 
@@ -632,8 +632,8 @@ async function takePnlSnapshot(slug) {
 //    CTF:     0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
 //    USDC.e:  0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
 
-const CTF_ADDRESS    = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-const USDCE_ADDRESS  = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const USDCE_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const PARENT_COLLECTION_ID = '0x0000000000000000000000000000000000000000000000000000000000000000';
 
 const CTF_ABI = [
@@ -703,8 +703,8 @@ async function pollAndRedeem(slug, attempt = 0) {
   // ── 3. Dry-run simulation ─────────────────────────────────────────────────
   if (CFG.dryRun) {
     const payout = won ? bet.sharesFilled * 1.00 : 0;
-    const pnl    = payout - bet.betSizeUsdc;
-    const c      = pnl >= 0 ? chalk.greenBright : chalk.redBright;
+    const pnl = payout - bet.betSizeUsdc;
+    const c = pnl >= 0 ? chalk.greenBright : chalk.redBright;
 
     log.dry(`[SIMULATED REDEEM] conditionId: ${bet.conditionId?.slice(0, 20)}…`);
     log.dry(`  Shares    : ${bet.sharesFilled.toFixed(4)}`);
@@ -762,8 +762,8 @@ async function pollAndRedeem(slug, attempt = 0) {
 
     if (receipt.status === 1) {
       const payout = won ? bet.sharesFilled * 1.00 : 0;
-      const pnl    = payout - bet.betSizeUsdc;
-      const c      = pnl >= 0 ? chalk.greenBright : chalk.redBright;
+      const pnl = payout - bet.betSizeUsdc;
+      const c = pnl >= 0 ? chalk.greenBright : chalk.redBright;
 
       log.divider();
       console.log(chalk.bgCyan.black.bold('  ┌─────────────────────────────────────────┐  '));
@@ -779,7 +779,7 @@ async function pollAndRedeem(slug, attempt = 0) {
       console.log(chalk.white(`  Shares     : ${bet.sharesFilled.toFixed(4)}`));
       console.log(chalk.white(`  Payout     : $${payout.toFixed(4)} USDC.e`));
       console.log(chalk.white(`  Cost       : $${bet.betSizeUsdc.toFixed(2)} USDC`));
-      console.log(c(            `  P&L        : ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDC`));
+      console.log(c(`  P&L        : ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDC`));
       log.divider();
 
       _ledger.get(slug).redeemResult = {
@@ -839,7 +839,7 @@ async function resolvedMeta(slug) {
 
 function ensureWsSubscription(meta) {
   const tokens = [meta.upTokenId, meta.downTokenId].filter(Boolean);
-  const fresh  = tokens.filter(t => !_wsSubscribed.has(t));
+  const fresh = tokens.filter(t => !_wsSubscribed.has(t));
   if (fresh.length) {
     wsMonitor.subscribe(fresh);
     fresh.forEach(t => _wsSubscribed.add(t));
@@ -850,14 +850,14 @@ function ensureWsSubscription(meta) {
 //  SECTION 12 — POLL LOOP  (runs every POLL_INTERVAL_MS)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const _pnlScheduled    = new Set();
+const _pnlScheduled = new Set();
 const _redeemScheduled = new Set();
 const _bettedIntervals = new Set();
 
 function scheduleSnapshotAndRedemption(slug, asset) {
   if (!_pnlScheduled.has(slug)) {
     _pnlScheduled.add(slug);
-    const secsLeft  = slugSecsLeft(slug);
+    const secsLeft = slugSecsLeft(slug);
     const snapDelay = Math.max((secsLeft - 1) * 1000, 500);
     log.info(`${asset.label}: P&L snapshot in ${(snapDelay / 1000).toFixed(1)}s`);
     setTimeout(() => takePnlSnapshot(slug), snapDelay);
@@ -891,17 +891,17 @@ async function evaluateAsset(asset, timeLeft) {
     `DOWN: ${pct(downP).padStart(7)}  (${src})`
   );
 
-  const upFit   = upP   != null && upP   > CFG.probMin && upP   < CFG.probMax;
+  const upFit = upP != null && upP > CFG.probMin && upP < CFG.probMax;
   const downFit = downP != null && downP > CFG.probMin && downP < CFG.probMax;
 
   if (!upFit && !downFit) return null;
 
   let side, price, tokenId;
   if (upFit && downFit) {
-    if ((upP ?? 0) >= (downP ?? 0)) { side = 'UP';   price = upP;   tokenId = meta.upTokenId; }
-    else                             { side = 'DOWN'; price = downP; tokenId = meta.downTokenId; }
+    if ((upP ?? 0) >= (downP ?? 0)) { side = 'UP'; price = upP; tokenId = meta.upTokenId; }
+    else { side = 'DOWN'; price = downP; tokenId = meta.downTokenId; }
   } else if (upFit) {
-    side = 'UP';   price = upP;   tokenId = meta.upTokenId;
+    side = 'UP'; price = upP; tokenId = meta.upTokenId;
   } else {
     side = 'DOWN'; price = downP; tokenId = meta.downTokenId;
   }
@@ -910,7 +910,7 @@ async function evaluateAsset(asset, timeLeft) {
 }
 
 async function poll() {
-  const timeLeft    = secsToExpiry();
+  const timeLeft = secsToExpiry();
   const intervalKey = currentIntervalKey();
 
   log.divider();
@@ -965,8 +965,8 @@ async function poll() {
   let orderId, fillPrice, sharesFilled;
 
   if (CFG.dryRun) {
-    orderId      = `DRY-${Date.now()}`;
-    fillPrice    = price;
+    orderId = `DRY-${Date.now()}`;
+    fillPrice = price;
     sharesFilled = CFG.betSizeUsdc / price;
     log.dry(`[SIMULATED] FOK BUY  ${asset.label} ${side}  $${CFG.betSizeUsdc}  @${pct(price)}`);
   } else {
@@ -975,14 +975,14 @@ async function poll() {
       log.error(`Bet failed: ${result.detail}`);
       return;
     }
-    orderId      = result.orderId;
-    fillPrice    = result.fillPrice   ?? price;
+    orderId = result.orderId;
+    fillPrice = result.fillPrice ?? price;
     sharesFilled = result.sharesFilled ?? CFG.betSizeUsdc / price;
   }
 
   recordBet(slug, {
     side,
-    asset:       asset.label,
+    asset: asset.label,
     betSizeUsdc: CFG.betSizeUsdc,
     orderId,
     fillPrice,
@@ -1018,7 +1018,7 @@ function printSessionSummary() {
 
   for (const b of bets) {
     totalCost += b.betSizeUsdc;
-    const snap   = b.pnlSnapshot;
+    const snap = b.pnlSnapshot;
     const redeem = b.redeemResult;
 
     console.log(chalk.cyan(`  ${b.slug}`));
@@ -1082,10 +1082,8 @@ console.log('');
 log.divider();
 
 if (!CFG.dryRun) {
-  if (!CFG.privateKey   || CFG.privateKey   === '0xYOUR_PRIVATE_KEY_HERE')
-    { log.error('PRIVATE_KEY missing/placeholder in .env'); process.exit(1); }
-  if (!CFG.funderAddress || CFG.funderAddress === '0xYOUR_WALLET_ADDRESS_HERE')
-    { log.error('FUNDER_ADDRESS missing/placeholder in .env'); process.exit(1); }
+  if (!CFG.privateKey || CFG.privateKey === '0xYOUR_PRIVATE_KEY_HERE') { log.error('PRIVATE_KEY missing/placeholder in .env'); process.exit(1); }
+  if (!CFG.funderAddress || CFG.funderAddress === '0xYOUR_WALLET_ADDRESS_HERE') { log.error('FUNDER_ADDRESS missing/placeholder in .env'); process.exit(1); }
 
   log.info('Initialising CLOB trader…');
   try {
@@ -1109,10 +1107,10 @@ if (!CFG.dryRun) {
   log.dry('Trader init skipped (dry-run).');
 }
 
-process.on('uncaughtException',  err => log.error(`Uncaught: ${err.message}`));
+process.on('uncaughtException', err => log.error(`Uncaught: ${err.message}`));
 process.on('unhandledRejection', err => log.error(`Unhandled rejection: ${err}`));
 
-process.on('SIGINT',  () => { printSessionSummary(); wsMonitor.close(); process.exit(0); });
+process.on('SIGINT', () => { printSessionSummary(); wsMonitor.close(); process.exit(0); });
 process.on('SIGTERM', () => { printSessionSummary(); wsMonitor.close(); process.exit(0); });
 
 log.info(`Polling every ${CFG.pollIntervalMs}ms — press Ctrl+C to stop`);
