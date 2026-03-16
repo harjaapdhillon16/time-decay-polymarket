@@ -794,12 +794,14 @@ async function closeTrade(slug, bet, retry = 0) {
     sellPrice = bet.fillPrice;
   }
 
-  // ── Step 3: align price to tick size ─────────────────────────────────────
+  // ── Step 3: align price to tick size, cap at 0.99 ────────────────────────
   const tickSize = await getTickSize(bet.tokenId);
   const tick     = parseFloat(tickSize);
-  // Floor to nearest tick to stay within allowed prices
-  const alignedPrice = Math.floor(sellPrice / tick) * tick;
-  const priceStr     = alignedPrice.toFixed(Math.ceil(-Math.log10(tick)));
+  // Floor to nearest tick. IMPORTANT: Polymarket max price is 0.99, never 1.00
+  const rawAligned = Math.floor(sellPrice / tick) * tick;
+  const capped     = Math.min(rawAligned, 0.99);
+  const decimals   = Math.ceil(-Math.log10(tick));
+  const priceStr   = capped.toFixed(decimals);
 
   // ── Step 4: floor shares to 4 decimal places ─────────────────────────────
   const sharesRounded = Math.floor(bet.sharesFilled * 10000) / 10000;
@@ -858,9 +860,63 @@ async function closeTrade(slug, bet, retry = 0) {
     }
   }
 }
+
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 11 — MARKET METADATA CACHE
+//  SECTION 10c — GLOBAL POSITION CLOSER
+//  Runs every 5 minutes and closes ALL open positions on the wallet,
+//  including ones from before this bot session started.
 // ──────────────────────────────────────────────────────────────────────────────
+
+const _closedPositions = new Set(); // track tokenIds already closed this session
+
+/**
+ * Fetches all open positions from the Data API, finds any with size > 0
+ * that are on expired/resolved markets, and tries to sell them.
+ * This catches positions from previous bot runs that weren't closed.
+ */
+async function closeAllOpenPositions() {
+  if (CFG.dryRun || !CFG.funderAddress) return;
+
+  try {
+    const { data } = await axios.get('https://data-api.polymarket.com/positions', {
+      params: { user: CFG.funderAddress, sizeThreshold: 0.01 },
+      timeout: 10_000,
+    });
+
+    const positions = Array.isArray(data) ? data : [];
+    if (!positions.length) return;
+
+    log.info(`[GLOBAL CLOSER] ${positions.length} open position(s) found on wallet`);
+
+    for (const pos of positions) {
+      if (!pos.asset || !pos.size || pos.size <= 0) continue;
+      if (_closedPositions.has(pos.asset)) continue;
+
+      // Only attempt to sell positions on closed markets (curPrice = 0.99 or 0.01)
+      const p = parseFloat(pos.curPrice ?? 0);
+      const isSettled = p >= 0.97 || p <= 0.03;
+      if (!isSettled) continue;
+
+      log.info(`[GLOBAL CLOSER] Closing position: ${pos.title?.slice(0, 40)}…  size=${pos.size}  price=${p}`);
+      _closedPositions.add(pos.asset);
+
+      // Build a synthetic bet object and call closeTrade
+      const syntheticBet = {
+        tokenId:     pos.asset,
+        sharesFilled: parseFloat(pos.size),
+        fillPrice:   parseFloat(pos.avgPrice ?? p),
+        betSizeUsdc: parseFloat(pos.initialValue ?? 0),
+      };
+
+      // Fire close immediately — no need to wait for on-chain balance (it's already there)
+      setTimeout(() => closeTrade(`wallet-position-${pos.asset.slice(0, 8)}`, syntheticBet, 0), 1000);
+    }
+  } catch (err) {
+    log.warn(`[GLOBAL CLOSER] Data API error: ${err.message}`);
+  }
+}
+
+
 
 // Cache keyed by slug — holds metadata for all three assets simultaneously
 const _metaCacheMap = new Map();   // slug → meta
@@ -1174,5 +1230,13 @@ process.on('SIGTERM', () => { printSessionSummary(); wsMonitor.close(); process.
 
 // ── Start ──────────────────────────────────────────────────────────────────
 log.info(`Polling every ${CFG.pollIntervalMs}ms — press Ctrl+C to stop`);
+
+// Run global position closer at startup (catches any unclosed positions from
+// previous sessions) and then every 5 minutes
+if (!CFG.dryRun) {
+  setTimeout(closeAllOpenPositions, 5_000);           // 5s after startup
+  setInterval(closeAllOpenPositions, 5 * 60 * 1_000); // then every 5 min
+}
+
 await poll();
 setInterval(poll, CFG.pollIntervalMs);
