@@ -9,9 +9,15 @@
 //  • Priority order: BTC → XRP → SOL  (first qualifying asset wins)
 //  • Only ONE bet is placed per 5-minute window across all assets
 //
+//  TRADING WINDOW
+//  ──────────────
+//  • Only active between 13:00 and 20:00 New York time (America/New_York)
+//  • Outside this window, polls are skipped with a brief log message
+//
 //  Every POLL_INTERVAL_MS milliseconds:
-//    1. Calculates current 5-min interval + seconds-to-expiry
-//    2. Ignores polls until < EXPIRY_THRESHOLD_SECS (90s) remain
+//    1. Checks current New York time — exits early if outside 13:00–20:00
+//    2. Calculates current 5-min interval + seconds-to-expiry
+//    3. Ignores polls until < EXPIRY_THRESHOLD_SECS (90s) remain
 //    3. Scans BTC first, then XRP, then SOL:
 //         – Fetches token IDs (Gamma API, cached per slug)
 //         – Resolves live UP/DOWN prices via WebSocket (REST fallback)
@@ -128,6 +134,46 @@ function intervalEnd() { return intervalStart() + INTERVAL_SECS; }
 function secsToExpiry() { return intervalEnd() - Math.floor(Date.now() / 1000); }
 function buildSlug(slugPrefix) { return `${slugPrefix}-${intervalStart()}`; }
 function currentIntervalKey() { return `interval-${intervalStart()}`; }
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  SECTION 3b — TRADING WINDOW  (13:00 – 20:00 New York time)
+// ──────────────────────────────────────────────────────────────────────────────
+
+const TRADING_TZ      = 'America/New_York';
+const TRADING_START_H = 13;   // 1:00 PM
+const TRADING_END_H   = 20;   // 8:00 PM  (exclusive — stops at 20:00:00)
+
+/**
+ * Returns true if the current wall-clock time in New York falls within
+ * [13:00:00, 20:00:00).  Handles EST/EDT automatically via Intl.
+ */
+function isWithinTradingWindow() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: TRADING_TZ,
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  }).formatToParts(now);
+
+  const hour   = parseInt(parts.find(p => p.type === 'hour').value,   10);
+  const minute = parseInt(parts.find(p => p.type === 'minute').value, 10);
+  const totalMins = hour * 60 + minute;
+
+  return totalMins >= TRADING_START_H * 60 && totalMins < TRADING_END_H * 60;
+}
+
+/**
+ * Returns the current HH:MM in New York time — used for log messages only.
+ */
+function nyTimeString() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: TRADING_TZ,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date());
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 4 — GAMMA API  (market discovery)
@@ -664,11 +710,17 @@ async function evaluateAsset(asset, timeLeft) {
 }
 
 async function poll() {
+  // ── Trading window gate: 1:00 PM – 8:00 PM New York time ─────────────────
+  if (!isWithinTradingWindow()) {
+    log.info(`Outside trading window (NY: ${nyTimeString()}) — waiting until 13:00 NY`);
+    return;
+  }
+
   const timeLeft = secsToExpiry();
   const intervalKey = currentIntervalKey();
 
   log.divider();
-  log.scan(`⏱  ${timeLeft}s to expiry  |  interval: ${intervalStart()}`);
+  log.scan(`⏱  ${timeLeft}s to expiry  |  interval: ${intervalStart()}  |  NY: ${nyTimeString()}`);
 
   for (const asset of CFG.assets) {
     const slug = buildSlug(asset.slugPrefix);
@@ -811,6 +863,7 @@ console.log('   🤖  Polymarket Multi-Asset 5-Minute Up/Down Bot  (single-file)
 console.log('');
 console.log(`   Assets     :  BTC (1st) → XRP (2nd) → SOL (3rd)  [priority order]`);
 console.log(`   Strategy   :  ${pct(CFG.probMin)} < P < ${pct(CFG.probMax)}  — first qualifying asset wins`);
+console.log(`   Window     :  13:00 – 20:00 New York time  (America/New_York)`);
 console.log(`   Trigger    :  last ${CFG.expiryThresholdSecs}s before expiry`);
 console.log(`   Bet size   :  $${CFG.betSizeUsdc} USDC  (one bet per 5-min window)`);
 console.log(`   P&L snap   :  T − 1s before market close`);
