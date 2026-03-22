@@ -141,7 +141,7 @@ function currentIntervalKey() { return `interval-${intervalStart()}`; }
 
 const TRADING_TZ      = 'America/New_York';
 const TRADING_START_H = 13;   // 1:00 PM
-const TRADING_END_H   = 20;   // 8:00 PM  (exclusive — stops at 20:00:00)
+const TRADING_END_H   = 22;   // 10:00 PM  (exclusive — stops at 22:00:00)
 
 /**
  * Returns true if the current wall-clock time in New York falls within
