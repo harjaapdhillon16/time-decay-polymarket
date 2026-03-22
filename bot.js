@@ -20,19 +20,6 @@
 //    4. Schedules a P&L snapshot exactly 1 second before market expiry
 //  • Never bets twice on the same 5-minute window
 //
-//  POST-RESOLUTION REDEMPTION  (via Builder Relayer Client)
-//  ──────────────────────────────────────────────────────────
-//  • After market expiry, polls ON-CHAIN to detect resolution
-//  • PRIMARY: Reads payoutDenominator on CTF contract (source of truth)
-//    If > 0, oracle has reported → reads payoutNumerators to determine winner
-//  • FALLBACK: Gamma API only used if Polygon RPC fails
-//  • Uses @polymarket/builder-relayer-client to relay CTF redeemPositions()
-//    through the user's Safe or Proxy wallet — gasless
-//  • Supports both standard CTF redeem and NegRisk adapter redeem
-//  • Winning tokens redeem at $1.00 each; losing tokens yield $0
-//  • Retries resolution checks every 15s for up to 10 minutes
-//  • No deadline — winning tokens are always redeemable
-//
 //  P&L SNAPSHOT (T – 1 s)
 //  ──────────────────────
 //  • Reads the current mid-price from the WS cache (or REST fallback)
@@ -52,19 +39,6 @@ import axios from 'axios';
 import chalk from 'chalk';
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-
-// ── viem + builder-relayer-client imports (for gasless redemption) ───────────
-import {
-  createWalletClient,
-  createPublicClient,
-  http,
-  encodeFunctionData,
-  zeroHash,
-} from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { polygon } from 'viem/chains';
-import { RelayClient, RelayerTxType } from '@polymarket/builder-relayer-client';
-import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 
 const { Wallet } = ethers;
 
@@ -100,16 +74,6 @@ const CFG = {
   clobSecret: process.env.CLOB_SECRET || null,
   clobPassphrase: process.env.CLOB_PASSPHRASE || null,
 
-  // ── Builder Relayer credentials (required for on-chain redemption) ─────────
-  // Apply for Builder access at: https://docs.polymarket.com/developers/builders/builder-intro
-  builderApiKey: process.env.BUILDER_API_KEY || null,
-  builderSecret: process.env.BUILDER_SECRET || null,
-  builderPassphrase: process.env.BUILDER_PASSPHRASE || null,
-  relayerUrl: process.env.POLYMARKET_RELAYER_URL || 'https://relayer.polymarket.com',
-
-  // Polygon RPC for read-only on-chain checks (payoutDenominator)
-  polygonRpcUrl: process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com',
-
   betSizeUsdc: _envFloat('BET_SIZE_USDC', 5),
   probMin: _envFloat('PROB_MIN', 0.80),
   probMax: _envFloat('PROB_MAX', 0.90),
@@ -131,12 +95,6 @@ const CFG = {
 if (CFG.probMin >= CFG.probMax)
   throw new Error(`PROB_MIN (${CFG.probMin}) must be < PROB_MAX (${CFG.probMax})`);
 
-// ── Redemption constants ────────────────────────────────────────────────────
-const REDEEM = {
-  pollIntervalMs: 15_000,   // check resolution every 15s
-  maxAttempts: 40,           // 40 × 15s = ~10 minutes
-};
-
 // ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 2 — LOGGER
 // ──────────────────────────────────────────────────────────────────────────────
@@ -150,7 +108,6 @@ const log = {
   trade: (...a) => console.log(ts(), chalk.magentaBright('[TRADE]'), ...a),
   scan: (...a) => console.log(ts(), chalk.blue('[SCAN]'), ...a),
   pnl: (...a) => console.log(ts(), chalk.bgGreen.black('[P&L]'), ...a),
-  redeem: (...a) => console.log(ts(), chalk.bgCyan.black('[REDEEM]'), ...a),
   dry: (...a) => console.log(ts(), chalk.bgYellow.black('[DRY]'), ...a),
   divider: () => console.log(chalk.gray('─'.repeat(72))),
 };
@@ -173,7 +130,7 @@ function buildSlug(slugPrefix) { return `${slugPrefix}-${intervalStart()}`; }
 function currentIntervalKey() { return `interval-${intervalStart()}`; }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 4 — GAMMA API  (market discovery + resolution check)
+//  SECTION 4 — GAMMA API  (market discovery)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -190,7 +147,6 @@ function _parseJsonField(val) {
 
 async function fetchMarketMeta(slug) {
   try {
-    // ── Strategy 1: /events?slug=<slug> (the event slug from the 5-min series)
     const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
       params: { slug }, timeout: 8_000,
     });
@@ -210,149 +166,21 @@ async function fetchMarketMeta(slug) {
       ? Math.floor(new Date(event.endDate).getTime() / 1000)
       : intervalEnd();
 
-    // Detect neg_risk for proper redeem routing
-    const negRisk = event.negRisk === true || market.negRiskOther === true;
-    const negRiskMarketId = event.negRiskMarketID || '';
-
     return {
       slug,
       endTimestamp,
       question: market.question || '',
       conditionId: market.conditionId || '',
-      marketId: market.id || null,          // Gamma market ID for direct lookups
-      marketSlug: market.slug || null,      // market-level slug (may differ from event slug)
+      marketId: market.id || null,
+      marketSlug: market.slug || null,
       upTokenId: upIdx >= 0 ? tokenIds[upIdx] : tokenIds[0],
       downTokenId: downIdx >= 0 ? tokenIds[downIdx] : tokenIds[1],
-      outcomes,                              // store parsed outcomes for resolution matching
-      negRisk,
-      negRiskMarketId,
+      outcomes,
     };
   } catch (err) {
     log.error(`Gamma API error: ${err.message}`);
     return null;
   }
-}
-
-/**
- * Determine the winning outcome from a resolved market's outcomePrices.
- *
- * After resolution, Gamma sets outcomePrices to e.g. '["1","0"]' where
- * the outcome at the index with price "1" (or close to 1.0) is the winner.
- * Combined with outcomes '["Up","Down"]', we can determine: "Up" won.
- *
- * Returns the winning outcome string (e.g. "Up" or "Down"), or null.
- */
-function _resolveWinnerFromPrices(outcomePricesRaw, outcomesRaw) {
-  const prices = _parseJsonField(outcomePricesRaw);
-  const outcomes = _parseJsonField(outcomesRaw);
-  if (!prices.length || !outcomes.length) return null;
-
-  for (let i = 0; i < prices.length; i++) {
-    const p = parseFloat(prices[i]);
-    if (p >= 0.95) return outcomes[i] || null;   // price ~1.0 = winner
-  }
-  return null;
-}
-
-/**
- * Check whether a market has resolved via Gamma API.
- *
- * Uses three lookup strategies in priority order:
- *   1. GET /markets?condition_ids=<conditionId>  (most reliable if we have it)
- *   2. GET /markets/<marketId>                    (if we stored Gamma market ID)
- *   3. GET /events?slug=<slug>                    (fallback via event slug)
- *
- * The Gamma API has NO "resolved" boolean field. Resolution is detected from:
- *   • closed === true           (market is closed for trading)
- *   • active === false          (market is no longer active)
- *   • resolvedBy !== null       (populated after resolution)
- *   • outcomePrices             (winner's price → 1.0, loser → 0.0)
- *   • acceptingOrders === false (not accepting new orders)
- *
- * Returns { resolved, outcome, outcomePrices, resolvedBy } or null on error.
- */
-async function checkMarketResolved(slug, conditionId, marketId) {
-  let market = null;
-
-  // ── Strategy 1: Query by conditionId (most reliable) ────────────────────
-  if (conditionId) {
-    try {
-      const { data } = await axios.get(`${CFG.gammaApiUrl}/markets`, {
-        params: { condition_ids: conditionId, limit: 1 },
-        timeout: 8_000,
-      });
-      if (Array.isArray(data) && data.length) {
-        market = data[0];
-        log.redeem(`  Resolution lookup via condition_id: ${conditionId.slice(0, 16)}…`);
-      }
-    } catch (err) {
-      log.warn(`  condition_id lookup failed: ${err.message}`);
-    }
-  }
-
-  // ── Strategy 2: Query by Gamma market ID ────────────────────────────────
-  if (!market && marketId) {
-    try {
-      const { data } = await axios.get(`${CFG.gammaApiUrl}/markets/${marketId}`, {
-        timeout: 8_000,
-      });
-      if (data && data.id) {
-        market = data;
-        log.redeem(`  Resolution lookup via market ID: ${marketId}`);
-      }
-    } catch (err) {
-      log.warn(`  market ID lookup failed: ${err.message}`);
-    }
-  }
-
-  // ── Strategy 3: Fallback — query events by slug ─────────────────────────
-  if (!market) {
-    try {
-      const { data } = await axios.get(`${CFG.gammaApiUrl}/events`, {
-        params: { slug }, timeout: 8_000,
-      });
-      if (Array.isArray(data) && data.length) {
-        market = data[0].markets?.[0];
-        if (market) log.redeem(`  Resolution lookup via event slug: ${slug}`);
-      }
-    } catch (err) {
-      log.warn(`  Event slug lookup failed: ${err.message}`);
-    }
-  }
-
-  if (!market) {
-    log.warn(`  No market data found for resolution check (slug=${slug})`);
-    return null;
-  }
-
-  // ── Detect resolution from actual Gamma API fields ──────────────────────
-  const isClosed = market.closed === true;
-  const isInactive = market.active === false;
-  const hasResolver = !!market.resolvedBy;
-  const notAccepting = market.acceptingOrders === false;
-
-  // outcomePrices is the strongest signal: after resolution, winner = "1", loser = "0"
-  const outcomePrices = _parseJsonField(market.outcomePrices);
-  const hasSettledPrices = outcomePrices.some(p => parseFloat(p) >= 0.95);
-
-  // A market is resolved when it's closed AND prices have settled
-  const resolved = isClosed && (hasSettledPrices || hasResolver);
-
-  // Determine the winning outcome name (e.g. "Up" or "Down")
-  const winningOutcome = resolved
-    ? _resolveWinnerFromPrices(market.outcomePrices, market.outcomes)
-    : null;
-
-  log.redeem(`  Market state: closed=${isClosed} active=${!isInactive} resolvedBy=${market.resolvedBy || 'null'} acceptingOrders=${!notAccepting}`);
-  log.redeem(`  Outcome prices: ${JSON.stringify(outcomePrices)}  →  winner: ${winningOutcome || 'none yet'}`);
-
-  return {
-    resolved,
-    outcome: winningOutcome,
-    outcomePrices,
-    resolvedBy: market.resolvedBy || null,
-    conditionId: market.conditionId || conditionId,
-  };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -658,7 +486,7 @@ async function fetchFillFromTrades(tokenId) {
 
 const _ledger = new Map();
 
-function recordBet(slug, data) { _ledger.set(slug, { ...data, redeemResult: null, pnlSnapshot: null }); }
+function recordBet(slug, data) { _ledger.set(slug, { ...data, pnlSnapshot: null }); }
 function hasBet(slug) { return _ledger.has(slug); }
 function getBet(slug) { return _ledger.get(slug); }
 function allBets() { return [..._ledger.entries()].map(([slug, d]) => ({ slug, ...d })); }
@@ -752,480 +580,6 @@ async function takePnlSnapshot(slug) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  SECTION 10b — POST-RESOLUTION TOKEN REDEMPTION
-//               (via Builder Relayer Client — gasless, Safe/Proxy compatible)
-// ──────────────────────────────────────────────────────────────────────────────
-//
-//  Uses @polymarket/builder-relayer-client to relay CTF redeemPositions()
-//  through Polymarket's relayer infrastructure. This handles both Safe and
-//  Proxy wallet types transparently — no direct on-chain signing required.
-//
-//  The relayer encodes your transaction, wraps it for the correct wallet type,
-//  signs via Builder credentials, and submits to Polygon. Gas is covered by
-//  the relayer (gasless for the user).
-//
-//  Two redeem paths:
-//    1. Standard CTF redeem  — for normal (non-neg-risk) binary markets
-//    2. NegRisk Adapter redeem — for neg-risk event markets
-//
-//  Addresses (Polygon mainnet):
-//    CTF:             0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
-//    USDC.e:          0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-//    NegRisk Adapter: 0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296
-
-const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-const USDCE_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
-
-// ── ABI fragments for viem encodeFunctionData ───────────────────────────────
-
-const CTF_REDEEM_ABI = [
-  {
-    constant: false,
-    inputs: [
-      { name: 'collateralToken', type: 'address' },
-      { name: 'parentCollectionId', type: 'bytes32' },
-      { name: 'conditionId', type: 'bytes32' },
-      { name: 'indexSets', type: 'uint256[]' },
-    ],
-    name: 'redeemPositions',
-    outputs: [],
-    payable: false,
-    stateMutability: 'nonpayable',
-    type: 'function',
-  },
-];
-
-const NR_ADAPTER_REDEEM_ABI = [
-  {
-    inputs: [
-      { internalType: 'bytes32', name: '_conditionId', type: 'bytes32' },
-      { internalType: 'uint256[]', name: '_amounts', type: 'uint256[]' },
-    ],
-    name: 'redeemPositions',
-    outputs: [],
-    stateMutability: 'nonpayable',
-    type: 'function',
-  },
-];
-
-const CTF_READ_ABI = [
-  {
-    inputs: [{ name: 'conditionId', type: 'bytes32' }],
-    name: 'payoutDenominator',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function',
-  },
-  {
-    inputs: [
-      { name: 'conditionId', type: 'bytes32' },
-      { name: 'index', type: 'uint256' },
-    ],
-    name: 'payoutNumerators',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function',
-  },
-];
-
-// ── Lazy-initialised viem clients + relayer ─────────────────────────────────
-
-let _viemWallet = null;
-let _viemPublic = null;
-let _relayClient = null;
-
-function getViemPublicClient() {
-  if (!_viemPublic) {
-    _viemPublic = createPublicClient({
-      chain: polygon,
-      transport: http(CFG.polygonRpcUrl),
-    });
-  }
-  return _viemPublic;
-}
-
-function getViemWalletClient() {
-  if (!_viemWallet) {
-    const account = privateKeyToAccount(CFG.privateKey);
-    _viemWallet = createWalletClient({
-      account,
-      chain: polygon,
-      transport: http(CFG.polygonRpcUrl),
-    });
-  }
-  return _viemWallet;
-}
-
-function getRelayClient() {
-  if (_relayClient) return _relayClient;
-
-  const wallet = getViemWalletClient();
-
-  // Determine transaction type from signatureType config
-  const txType = CFG.signatureType === 1
-    ? RelayerTxType.PROXY
-    : RelayerTxType.SAFE;
-
-  if (CFG.builderApiKey && CFG.builderSecret && CFG.builderPassphrase) {
-    // Authenticated relay with Builder credentials
-    const builderConfig = new BuilderConfig({
-      localBuilderCreds: {
-        key: CFG.builderApiKey,
-        secret: CFG.builderSecret,
-        passphrase: CFG.builderPassphrase,
-      },
-    });
-    _relayClient = new RelayClient(
-      CFG.relayerUrl,
-      CFG.chainId,
-      wallet,
-      builderConfig,
-      txType,
-    );
-    log.ok(`Relayer client ready (${txType === RelayerTxType.PROXY ? 'PROXY' : 'SAFE'} mode, Builder auth)`);
-  } else {
-    // Unauthenticated relay (may have limited functionality)
-    _relayClient = new RelayClient(
-      CFG.relayerUrl,
-      CFG.chainId,
-      wallet,
-      undefined,
-      txType,
-    );
-    log.warn('Relayer client ready WITHOUT Builder auth — redemption may fail.');
-    log.warn('Set BUILDER_API_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE in .env');
-  }
-
-  return _relayClient;
-}
-
-// ── Build redeem transactions using viem ────────────────────────────────────
-
-function buildCtfRedeemTx(conditionId) {
-  const calldata = encodeFunctionData({
-    abi: CTF_REDEEM_ABI,
-    functionName: 'redeemPositions',
-    args: [USDCE_ADDRESS, zeroHash, conditionId, [1n, 2n]],
-  });
-  return { to: CTF_ADDRESS, data: calldata, value: '0' };
-}
-
-function buildNegRiskRedeemTx(conditionId, amounts) {
-  const calldata = encodeFunctionData({
-    abi: NR_ADAPTER_REDEEM_ABI,
-    functionName: 'redeemPositions',
-    args: [conditionId, amounts],
-  });
-  return { to: NEG_RISK_ADAPTER, data: calldata, value: '0' };
-}
-
-// ── On-chain resolution check (read-only via viem public client) ────────────
-
-/**
- * Check on-chain whether the oracle has reported payouts for this condition.
- *
- * This is the SOURCE OF TRUTH for resolution — far more reliable than Gamma API,
- * especially for fast 5-minute up/down markets where Gamma may lag or never
- * update the `resolved` field.
- *
- * Returns:
- *   { resolved: true,  winner: 'UP'|'DOWN', numerators: [n0, n1] }
- *   { resolved: false }
- *   null  (on RPC error)
- */
-async function checkResolutionOnChain(conditionId, meta) {
-  try {
-    const client = getViemPublicClient();
-
-    // 1. Check payoutDenominator — if > 0, oracle has reported
-    const payoutDenom = await client.readContract({
-      address: CTF_ADDRESS,
-      abi: CTF_READ_ABI,
-      functionName: 'payoutDenominator',
-      args: [conditionId],
-    });
-
-    log.redeem(`  On-chain payoutDenominator: ${payoutDenom.toString()}`);
-
-    if (payoutDenom === 0n || payoutDenom.toString() === '0') {
-      return { resolved: false };
-    }
-
-    // 2. Read payoutNumerators for both outcomes to determine the winner
-    //    For binary markets: index 0 and index 1
-    //    Winner has numerator > 0, loser has numerator = 0
-    const [num0, num1] = await Promise.all([
-      client.readContract({
-        address: CTF_ADDRESS,
-        abi: CTF_READ_ABI,
-        functionName: 'payoutNumerators',
-        args: [conditionId, 0n],
-      }),
-      client.readContract({
-        address: CTF_ADDRESS,
-        abi: CTF_READ_ABI,
-        functionName: 'payoutNumerators',
-        args: [conditionId, 1n],
-      }),
-    ]);
-
-    log.redeem(`  On-chain payoutNumerators: [${num0.toString()}, ${num1.toString()}]`);
-
-    // 3. Map numerator indices back to outcome names (Up/Down)
-    //    meta.outcomes was parsed during fetchMarketMeta — the order matches
-    //    the condition's outcome slot indices.
-    //    e.g. outcomes = ["Up", "Down"] → index 0 = Up, index 1 = Down
-    let winner = null;
-
-    if (meta && Array.isArray(meta.outcomes) && meta.outcomes.length >= 2) {
-      const outcomes = meta.outcomes;
-      if (num0 > 0n && num1 === 0n) {
-        winner = outcomes[0];   // index 0 won
-      } else if (num1 > 0n && num0 === 0n) {
-        winner = outcomes[1];   // index 1 won
-      }
-    }
-
-    // Fallback: if we couldn't map via meta, infer from Up/Down convention
-    // Polymarket 5-min markets typically have outcomes ["Up", "Down"] in that order
-    if (!winner) {
-      if (num0 > 0n && num1 === 0n) winner = 'Up';
-      else if (num1 > 0n && num0 === 0n) winner = 'Down';
-      else winner = 'Unknown';
-    }
-
-    log.redeem(`  On-chain winner: ${winner}`);
-
-    return {
-      resolved: true,
-      winner: winner.toUpperCase(),
-      numerators: [num0, num1],
-    };
-
-  } catch (err) {
-    log.warn(`  On-chain resolution check failed: ${err.message}`);
-    return null;
-  }
-}
-
-/**
- * Polls for market resolution then redeems tokens via Relayer Client.
- *
- * Resolution detection priority:
- *   1. ON-CHAIN (payoutDenominator > 0 + payoutNumerators) — source of truth
- *   2. GAMMA API — fallback only if RPC fails
- *
- * The Gamma API is unreliable for fast 5-minute up/down markets: it often
- * never sets `resolved=true` or `closed=true` even after the oracle reports.
- * On-chain payoutDenominator is the definitive signal that redemption is possible.
- */
-async function pollAndRedeem(slug, attempt = 0) {
-  const bet = getBet(slug);
-  if (!bet) return;
-
-  if (bet.redeemResult?.success) return;
-
-  if (attempt >= REDEEM.maxAttempts) {
-    log.warn(`${slug}: Gave up waiting for resolution after ${attempt} attempts.`);
-    log.warn('  Tokens remain in wallet — redeem manually at any time (no deadline).');
-    _ledger.get(slug).redeemResult = { success: false, reason: 'timeout' };
-    return;
-  }
-
-  log.redeem(`${slug}: Checking resolution… (attempt ${attempt + 1}/${REDEEM.maxAttempts})`);
-
-  // ── Guard: conditionId required ───────────────────────────────────────────
-  if (!bet.conditionId) {
-    log.error(`  Missing conditionId for ${slug} — cannot check resolution or redeem.`);
-    _ledger.get(slug).redeemResult = { success: false, reason: 'no_condition_id' };
-    return;
-  }
-
-  // ── 1. PRIMARY: Check on-chain (payoutDenominator + payoutNumerators) ─────
-  //    This is the source of truth. If payoutDenominator > 0, the UMA oracle
-  //    has reported and tokens are redeemable RIGHT NOW.
-  const meta = _metaCacheMap.get(slug) || null;
-  let resolvedOutcome = null;
-  let resolvedVia = null;
-
-  const onChain = await checkResolutionOnChain(bet.conditionId, meta);
-
-  if (onChain && onChain.resolved) {
-    resolvedOutcome = onChain.winner;
-    resolvedVia = 'on-chain (payoutNumerators)';
-    log.redeem(`  ✓ On-chain resolution confirmed — winner: ${resolvedOutcome}`);
-
-  } else if (onChain && !onChain.resolved) {
-    // On-chain says not resolved yet (payoutDenominator = 0)
-    log.redeem(`  On-chain: not resolved yet (payoutDenominator = 0)`);
-
-    // ── 2. FALLBACK: Try Gamma API as a hint ────────────────────────────────
-    //    Even if Gamma says "resolved", we still need payoutDenominator > 0
-    //    to actually redeem. But Gamma can tell us if we're close.
-    const gammaStatus = await checkMarketResolved(slug, bet.conditionId, bet.marketId || null);
-    if (gammaStatus?.resolved) {
-      log.redeem(`  Gamma says resolved (${gammaStatus.outcome}) but oracle not on-chain yet — waiting…`);
-    }
-
-    log.redeem(`  Retrying in ${REDEEM.pollIntervalMs / 1000}s`);
-    setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-    return;
-
-  } else {
-    // onChain === null → RPC error. Fall back to Gamma API entirely.
-    log.warn(`  On-chain check failed — falling back to Gamma API`);
-
-    const gammaStatus = await checkMarketResolved(slug, bet.conditionId, bet.marketId || null);
-    if (!gammaStatus || !gammaStatus.resolved) {
-      log.redeem(`  Gamma: not resolved yet — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
-      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-      return;
-    }
-
-    resolvedOutcome = (gammaStatus.outcome || '').toUpperCase();
-    resolvedVia = 'Gamma API (RPC fallback)';
-
-    if (!resolvedOutcome) {
-      log.warn(`  Gamma says resolved but no winner determined — retrying in ${REDEEM.pollIntervalMs / 1000}s`);
-      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-      return;
-    }
-
-    log.redeem(`  ✓ Gamma resolution — winner: ${resolvedOutcome}`);
-  }
-
-  // ── 3. Determine win/loss ─────────────────────────────────────────────────
-  log.divider();
-  log.redeem(`✅ Market RESOLVED  —  ${slug}  (via ${resolvedVia})`);
-  log.redeem(`   Outcome: ${resolvedOutcome}`);
-
-  const ourSide = bet.side.toUpperCase();
-  const won = resolvedOutcome === ourSide;
-
-  if (won) {
-    log.redeem(`   🎉 We bet ${ourSide} — WE WON!`);
-  } else {
-    log.redeem(`   😞 We bet ${ourSide}, resolved ${resolvedOutcome} — loss.`);
-  }
-
-  // ── 4. Dry-run simulation ─────────────────────────────────────────────────
-  if (CFG.dryRun) {
-    const payout = won ? bet.sharesFilled * 1.00 : 0;
-    const pnl = payout - bet.betSizeUsdc;
-    const c = pnl >= 0 ? chalk.greenBright : chalk.redBright;
-
-    log.dry(`[SIMULATED REDEEM] conditionId: ${bet.conditionId?.slice(0, 20)}…`);
-    log.dry(`  Shares    : ${bet.sharesFilled.toFixed(4)}`);
-    log.dry(`  Payout    : $${payout.toFixed(4)} USDC.e  (winning = $1.00/token, losing = $0.00)`);
-    log.dry(`  P&L       : ${c(`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`)}`);
-
-    _ledger.get(slug).redeemResult = {
-      success: true, txHash: `DRY-REDEEM-${Date.now()}`,
-      usdcReceived: payout, pnl, outcome: resolvedOutcome, won,
-    };
-    return;
-  }
-
-  try {
-    // ── 5. Build and relay the redeem transaction ───────────────────────────
-    const relay = getRelayClient();
-    const isNegRisk = bet.negRisk === true;
-
-    let redeemTx;
-    let redeemLabel;
-
-    if (isNegRisk) {
-      const yesAmount = won && ourSide === 'UP'
-        ? BigInt(Math.floor(bet.sharesFilled * 1e6))
-        : 0n;
-      const noAmount = won && ourSide === 'DOWN'
-        ? BigInt(Math.floor(bet.sharesFilled * 1e6))
-        : 0n;
-
-      redeemTx = buildNegRiskRedeemTx(bet.conditionId, [yesAmount, noAmount]);
-      redeemLabel = 'NegRisk adapter redeem';
-    } else {
-      redeemTx = buildCtfRedeemTx(bet.conditionId);
-      redeemLabel = 'CTF redeem';
-    }
-
-    log.redeem(`  Relaying ${redeemLabel} via Builder Relayer…`);
-    log.redeem(`    Target   : ${redeemTx.to}`);
-    log.redeem(`    Condition: ${bet.conditionId}`);
-    log.redeem(`    Method   : redeemPositions`);
-    log.redeem(`    Wallet   : ${CFG.signatureType === 1 ? 'PROXY' : 'SAFE'}`);
-
-    const response = await relay.execute([redeemTx], `redeem ${slug}`);
-    log.redeem(`  Tx relayed — waiting for confirmation…`);
-
-    const result = await response.wait();
-
-    if (result && result.transactionHash) {
-      const payout = won ? bet.sharesFilled * 1.00 : 0;
-      const pnl = payout - bet.betSizeUsdc;
-      const c = pnl >= 0 ? chalk.greenBright : chalk.redBright;
-
-      log.divider();
-      console.log(chalk.bgCyan.black.bold('  ┌─────────────────────────────────────────┐  '));
-      console.log(chalk.bgCyan.black.bold('  │       REDEMPTION CONFIRMED ✓            │  '));
-      console.log(chalk.bgCyan.black.bold('  └─────────────────────────────────────────┘  '));
-      console.log(chalk.white(`  Market     : ${slug}`));
-      console.log(chalk.white(`  Tx Hash    : ${result.transactionHash}`));
-      console.log(chalk.white(`  Block      : ${result.blockNumber || 'n/a'}`));
-      console.log(chalk.white(`  Our bet    : ${ourSide}`));
-      console.log(chalk.white(`  Outcome    : ${resolvedOutcome}`));
-      console.log(chalk.white(`  Result     : ${won ? '🎉 WIN' : '😞 LOSS'}`));
-      console.log(chalk.white(`  Shares     : ${bet.sharesFilled.toFixed(4)}`));
-      console.log(chalk.white(`  Payout     : $${payout.toFixed(4)} USDC.e`));
-      console.log(chalk.white(`  Cost       : $${bet.betSizeUsdc.toFixed(2)} USDC`));
-      console.log(c(`  P&L        : ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDC`));
-      log.divider();
-
-      _ledger.get(slug).redeemResult = {
-        success: true,
-        txHash: result.transactionHash,
-        blockNumber: result.blockNumber || null,
-        usdcReceived: payout,
-        pnl,
-        outcome: resolvedOutcome,
-        won,
-      };
-    } else {
-      log.error(`  Relay returned no transaction hash — redemption may have failed.`);
-      _ledger.get(slug).redeemResult = { success: false, reason: 'no_tx_hash' };
-
-      if (attempt < REDEEM.maxAttempts - 1) {
-        log.info('  Retrying redemption in 30s…');
-        setTimeout(() => pollAndRedeem(slug, attempt + 1), 30_000);
-      }
-    }
-
-  } catch (err) {
-    log.error(`  Redemption relay failed: ${err.message}`);
-
-    if (err.message.includes('revert') || err.message.includes('CALL_EXCEPTION')) {
-      log.warn('  This usually means the UMA oracle hasn\'t settled on-chain yet.');
-      log.warn(`  Retrying in ${REDEEM.pollIntervalMs / 1000}s…`);
-      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-    } else if (err.message.includes('auth') || err.message.includes('401') || err.message.includes('403')) {
-      log.error('  Builder authentication failed — check BUILDER_API_KEY / SECRET / PASSPHRASE');
-      _ledger.get(slug).redeemResult = { success: false, reason: 'auth_failed' };
-    } else {
-      log.warn(`  Retrying in ${REDEEM.pollIntervalMs / 1000}s…`);
-      setTimeout(() => pollAndRedeem(slug, attempt + 1), REDEEM.pollIntervalMs);
-    }
-  }
-}
-
-function scheduleRedemption(slug, asset) {
-  const secsLeft = slugSecsLeft(slug);
-  const delayMs = Math.max((secsLeft + 10) * 1000, 1000);
-  log.info(`${asset.label}: Redemption poll starts in ${(delayMs / 1000).toFixed(0)}s (after expiry + 10s buffer)`);
-  setTimeout(() => pollAndRedeem(slug, 0), delayMs);
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 //  SECTION 11 — MARKET META CACHE + WS SUBSCRIPTIONS
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1240,7 +594,6 @@ async function resolvedMeta(slug) {
   log.info(`  [${slug}] Market: "${meta.question}"`);
   log.info(`    UP   token: …${meta.upTokenId?.slice(-10)}`);
   log.info(`    DOWN token: …${meta.downTokenId?.slice(-10)}`);
-  if (meta.negRisk) log.info(`    NegRisk  : YES`);
   return meta;
 }
 
@@ -1258,21 +611,15 @@ function ensureWsSubscription(meta) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 const _pnlScheduled = new Set();
-const _redeemScheduled = new Set();
 const _bettedIntervals = new Set();
 
-function scheduleSnapshotAndRedemption(slug, asset) {
+function schedulePnlSnapshot(slug, asset) {
   if (!_pnlScheduled.has(slug)) {
     _pnlScheduled.add(slug);
     const secsLeft = slugSecsLeft(slug);
     const snapDelay = Math.max((secsLeft - 1) * 1000, 500);
     log.info(`${asset.label}: P&L snapshot in ${(snapDelay / 1000).toFixed(1)}s`);
     setTimeout(() => takePnlSnapshot(slug), snapDelay);
-  }
-
-  if (!_redeemScheduled.has(slug)) {
-    _redeemScheduled.add(slug);
-    scheduleRedemption(slug, asset);
   }
 }
 
@@ -1326,7 +673,7 @@ async function poll() {
   for (const asset of CFG.assets) {
     const slug = buildSlug(asset.slugPrefix);
     if (hasBet(slug)) {
-      scheduleSnapshotAndRedemption(slug, asset);
+      schedulePnlSnapshot(slug, asset);
     }
   }
 
@@ -1397,14 +744,13 @@ async function poll() {
     tokenId,
     conditionId: signal.meta.conditionId || null,
     marketId: signal.meta.marketId || null,
-    negRisk: signal.meta.negRisk || false,
     placedAt: new Date().toISOString(),
   });
 
   _bettedIntervals.add(intervalKey);
   log.ok(`Bet recorded ✓  ${asset.label} ${side}  orderId=${orderId}`);
 
-  scheduleSnapshotAndRedemption(slug, asset);
+  schedulePnlSnapshot(slug, asset);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1428,7 +774,6 @@ function printSessionSummary() {
   for (const b of bets) {
     totalCost += b.betSizeUsdc;
     const snap = b.pnlSnapshot;
-    const redeem = b.redeemResult;
 
     console.log(chalk.cyan(`  ${b.slug}`));
     console.log(`    Asset    : ${b.asset || 'unknown'}`);
@@ -1437,22 +782,9 @@ function printSessionSummary() {
     console.log(`    Fill     : ${pct(b.fillPrice)}  × ${b.sharesFilled?.toFixed(4)} shares`);
     console.log(`    Cost     : $${b.betSizeUsdc}`);
 
-    if (redeem?.success) {
-      totalPnl += redeem.pnl;
-      const plColour = redeem.pnl >= 0 ? chalk.green : chalk.red;
-      console.log(`    Outcome  : ${redeem.won ? '🎉 WIN' : '😞 LOSS'}  (${redeem.outcome})`);
-      console.log(`    Redeemed : ✅  tx: ${redeem.txHash?.slice(0, 20)}…`);
-      console.log(`    Payout   : $${redeem.usdcReceived?.toFixed(4)} USDC.e`);
-      console.log(`    P&L      : ${plColour(`${redeem.pnl >= 0 ? '+' : ''}$${redeem.pnl.toFixed(4)}`)}`);
-    } else if (redeem) {
-      console.log(chalk.yellow(`    Redeem   : ❌ ${redeem.reason || 'failed'} — tokens remain in wallet (redeemable anytime)`));
-    } else {
-      console.log(chalk.gray('    Redeem   : ⏳ pending (resolution not yet detected)'));
-    }
-
     if (snap) {
       const pl = snap.unrealisedPnl;
-      if (!redeem?.success) totalPnl += pl;
+      totalPnl += pl;
       const plColour = pl >= 0 ? chalk.green : chalk.red;
       console.log(`    Unr. P&L : ${plColour(`${pl >= 0 ? '+' : ''}$${pl.toFixed(4)}`)}`);
       console.log(`    Outlook  : ${snap.outlook}`);
@@ -1473,8 +805,6 @@ function printSessionSummary() {
 //  SECTION 14 — STARTUP  (pre-flight + banner)
 // ──────────────────────────────────────────────────────────────────────────────
 
-const hasBuilderCreds = !!(CFG.builderApiKey && CFG.builderSecret && CFG.builderPassphrase);
-
 log.divider();
 console.log('');
 console.log('   🤖  Polymarket Multi-Asset 5-Minute Up/Down Bot  (single-file)');
@@ -1483,13 +813,10 @@ console.log(`   Assets     :  BTC (1st) → XRP (2nd) → SOL (3rd)  [priority o
 console.log(`   Strategy   :  ${pct(CFG.probMin)} < P < ${pct(CFG.probMax)}  — first qualifying asset wins`);
 console.log(`   Trigger    :  last ${CFG.expiryThresholdSecs}s before expiry`);
 console.log(`   Bet size   :  $${CFG.betSizeUsdc} USDC  (one bet per 5-min window)`);
-console.log(`   Redeem     :  Builder Relayer Client (gasless, Safe/Proxy)`);
 console.log(`   P&L snap   :  T − 1s before market close`);
 console.log(`   Auth type  :  ${CFG.signatureType === 0 ? '0 — EOA / MetaMask' : CFG.signatureType === 1 ? '1 — Google / Magic Link proxy' : '2 — Gnosis Safe'}`);
-console.log(`   Builder    :  ${hasBuilderCreds ? '✅ credentials set' : '⚠️  NOT SET (redemption will fail)'}`);
 console.log(`   Mode       :  ${CFG.dryRun ? '✅  DRY-RUN (no real orders)' : '🔴  LIVE TRADING'}`);
 console.log(`   Poll       :  every ${CFG.pollIntervalMs}ms`);
-console.log(`   Redeem     :  poll every ${REDEEM.pollIntervalMs / 1000}s, up to ${REDEEM.maxAttempts} attempts`);
 console.log('');
 log.divider();
 
@@ -1505,28 +832,8 @@ if (!CFG.dryRun) {
     log.error(`Trader init failed: ${err.message}`);
     process.exit(1);
   }
-
-  // Verify Polygon RPC for on-chain reads (payoutDenominator check)
-  log.info('Verifying Polygon RPC connectivity (viem public client)…');
-  try {
-    const blockNum = await getViemPublicClient().getBlockNumber();
-    log.ok(`Polygon RPC connected — latest block: ${blockNum}`);
-  } catch (err) {
-    log.warn(`Polygon RPC check failed: ${err.message}`);
-    log.warn('payoutDenominator pre-check will be skipped — relayer will still attempt redemption.');
-  }
-
-  // Initialise relayer client (validates Builder creds)
-  log.info('Initialising Builder Relayer Client…');
-  try {
-    getRelayClient();
-  } catch (err) {
-    log.error(`Relayer init failed: ${err.message}`);
-    log.warn('Redemption will not work — but bets can still be placed.');
-  }
-
 } else {
-  log.dry('Trader + Relayer init skipped (dry-run).');
+  log.dry('Trader init skipped (dry-run).');
 }
 
 process.on('uncaughtException', err => log.error(`Uncaught: ${err.message}`));
